@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pnpm install *)",
+      "Bash(npm -v)",
+      "Bash(corepack --version)",
+      "Bash(corepack enable *)",
+      "Bash(corepack prepare *)",
+      "Bash(pnpm -v)",
+      "Bash(npx pnpm *)",
+      "Bash(node packages/cli/dist/index.js studio)",
+      "Bash(curl -fsS \"http://127.0.0.1:4567\")"
+    ]
+  }
+}

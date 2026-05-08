@@ -327,6 +327,7 @@ function applyCommonEnv(
 ): void {
   if (env.INKOS_LLM_TEMPERATURE) llm.temperature = Number.parseFloat(env.INKOS_LLM_TEMPERATURE);
   if (env.INKOS_LLM_THINKING_BUDGET) llm.thinkingBudget = Number.parseInt(env.INKOS_LLM_THINKING_BUDGET, 10);
+  if (env.INKOS_LLM_PROXY_URL) llm.proxyUrl = env.INKOS_LLM_PROXY_URL;
   if (env.INKOS_LLM_API_FORMAT) llm.apiFormat = env.INKOS_LLM_API_FORMAT;
   if (env.INKOS_LLM_STREAM) llm.stream = parseBoolean(env.INKOS_LLM_STREAM);
   if (env.INKOS_DEFAULT_LANGUAGE) config.language = env.INKOS_DEFAULT_LANGUAGE;
@@ -457,9 +458,14 @@ function assertModelBelongsToService(entry: ServiceConfigEntry | undefined, mode
 }
 
 function modelBelongsToService(service: string, model: string): boolean {
+  if (serviceAllowsUnlistedModels(service)) return true;
   const endpoint = getEndpoint(service);
   if (!endpoint) return true;
   return endpoint.models.some((knownModel) => knownModel.id.toLowerCase() === model.toLowerCase());
+}
+
+function serviceAllowsUnlistedModels(service: string): boolean {
+  return service === "ollama";
 }
 
 function serviceEntryKey(entry: ServiceConfigEntry): string {

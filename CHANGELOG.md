@@ -1,5 +1,63 @@
 # Changelog
 
+## v1.3.10
+
+### Release Focus
+
+建书 platform 热修：修复 `sub_agent.platform` 参数在网页和命令行建书时可能因中文/别名输入触发 schema 校验失败的问题，并把新书创建链路统一收口到合法平台值。
+
+### Bug Fixes
+
+- 修复建书过程中工具调用报 `Validation failed for tool "sub_agent": - platform: must be equal to constant`，导致无法生成书籍文件的问题
+- 统一 Studio、CLI、TUI、agent create-book 链路的平台别名归一化，`番茄` / `fanqie` / `番茄小说` 等输入会落到合法枚举
+- 对未知平台值降级为 `other`，避免错误平台 id 写入书籍配置后继续影响后续流程
+- 更新 README 微信交流群二维码为 13 群
+
+## v1.3.9
+
+### Release Focus
+
+Studio 建书与书籍设置热修：修复新建书籍链路被已有书籍 session 劫持的问题，并恢复可见的书籍设置页入口。
+
+### Bug Fixes
+
+- 修复 Studio 新建书籍 `/new`、`/create` 没有绑定独立 orphan session，导致建书请求可能被当前书籍工作台 session 接管的问题
+- 修复建书完成后无法可靠跳转到新书 Chat 工作台的问题
+- 恢复书籍设置页路由：`#/book/:id` 继续作为 Chat 工作台，`#/book/:id/settings` 用于修改书籍配置
+- 修复 Dashboard 书籍菜单里的“书籍设置”实际打开 Chat 工作台的问题
+
+## v1.3.8
+
+### Release Focus
+
+本地模型热修：修复 1.3.7 后 Ollama / 本地 OpenAI-compatible 端点在建书与续写链路里的配置回归，确保 Studio 与 CLI 都能继续使用无 API key 的本地模型。
+
+### Bug Fixes
+
+- 修复 Studio 服务测试、模型列表与建书链路强制要求 API key，导致 Ollama / 本地端点不可用的问题
+- 修复 Studio 新建书籍页面实际 `/agent` 建书路径没有正确传递空 key 本地模型 client 的问题
+- 修复 CLI / Studio 使用 Ollama 动态模型名时被内置模型表误拦的问题
+- 修复 `write next --context` 没有真正进入章节规划和正文写作提示词的问题
+
+## v1.3.7
+
+### Release Focus
+
+长篇写作质量收紧：把近期验证过的网文写法规则落到 Writer、Planner、Architect 与后置校验中，重点改善开篇抓人、章节密度、伏笔兑现、段落节奏和架构稿完整性。
+
+### Improvements
+
+- **网文写作规则入链路**：Writer prompt 新增看点密度、移动端段落、开篇第一屏、章节断章和人物行动动机等写作约束，让模型更少写空转铺垫和报告式正文
+- **Planner / Architect 对齐写作目标**：章节规划和书籍架构稿更明确地承接黄金开篇、章节目标、hook 账和段落式 foundation 输出要求
+- **Hook 兑现更具体**：hook ledger 要求 advance / resolve 项在正文里有可定位的动作、物件、对话或事件兑现，减少“账本里有、正文里没有”的断层
+- **段落密度规则收紧**：强调密度来自语义和场景推进，不是把正文切成电报体；连续短段会被后置规则识别
+
+### Bug Fixes
+
+- 修复 Architect 在扩展输出时可能漏掉 5 个 foundation SECTION 块的问题
+- 修复 hook ledger payoff 检查过于宽松，导致侧面暗示也可能被误判为兑现的问题
+- 修复写作 prompt 对段落尺寸描述不够明确，模型容易在“1-3 点密度”规则下过度碎段的问题
+
 ## v1.3.6
 
 ### Release Focus

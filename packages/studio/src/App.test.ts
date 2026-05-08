@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { deriveActiveBookId } from "./App";
+import { deriveActiveBookId, isStandaloneBookCreateRoute } from "./App";
 
 describe("deriveActiveBookId", () => {
   it("returns the current book across book-centered routes", () => {
@@ -7,11 +7,19 @@ describe("deriveActiveBookId", () => {
     expect(deriveActiveBookId({ page: "chapter", bookId: "beta", chapterNumber: 3 })).toBe("beta");
     expect(deriveActiveBookId({ page: "truth", bookId: "gamma" })).toBe("gamma");
     expect(deriveActiveBookId({ page: "analytics", bookId: "delta" })).toBe("delta");
+    expect(deriveActiveBookId({ page: "book-settings", bookId: "epsilon" })).toBe("epsilon");
   });
 
   it("returns undefined for non-book routes", () => {
     expect(deriveActiveBookId({ page: "dashboard" })).toBeUndefined();
     expect(deriveActiveBookId({ page: "services" })).toBeUndefined();
     expect(deriveActiveBookId({ page: "style" })).toBeUndefined();
+  });
+});
+
+describe("isStandaloneBookCreateRoute", () => {
+  it("keeps the new-book route on the dedicated creation page instead of book chat", () => {
+    expect(isStandaloneBookCreateRoute({ page: "book-create" })).toBe(true);
+    expect(isStandaloneBookCreateRoute({ page: "book", bookId: "alpha" })).toBe(false);
   });
 });

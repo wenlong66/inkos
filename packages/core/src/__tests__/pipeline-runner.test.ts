@@ -3,7 +3,7 @@ import { createRequire } from "node:module";
 import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PipelineRunner } from "../pipeline/runner.js";
+import { buildImportFoundationSource, PipelineRunner } from "../pipeline/runner.js";
 import * as llmProvider from "../llm/provider.js";
 import { StateManager } from "../state/manager.js";
 import { ArchitectAgent } from "../agents/architect.js";
@@ -40,6 +40,34 @@ const ZERO_USAGE = {
   completionTokens: 0,
   totalTokens: 0,
 } as const;
+
+describe("buildImportFoundationSource", () => {
+  it("compacts large imported books into opening, middle anchors, ending, and title catalog", () => {
+    const chapters = Array.from({ length: 36 }, (_, index) => {
+      const n = index + 1;
+      return {
+        title: `第${n}章 标题${n}`,
+        content: `OPEN-${n}\n${"正文".repeat(3000)}\nTAIL-${n}`,
+      };
+    });
+    const fullText = chapters.map((chapter, index) => `第${index + 1}章 ${chapter.title}\n\n${chapter.content}`).join("\n\n---\n\n");
+
+    const source = buildImportFoundationSource(chapters, "zh", {
+      maxFullTextChars: 20_000,
+      chapterExcerptChars: 1_200,
+      titleCatalogChars: 2_000,
+    });
+
+    expect(source.length).toBeLessThan(fullText.length / 2);
+    expect(source).toContain("压缩资料包");
+    expect(source).toContain("完整章节将在后续顺序回放");
+    expect(source).toContain("第1章 第1章 标题1");
+    expect(source).toContain("第36章 第36章 标题36");
+    expect(source).toContain("OPEN-1");
+    expect(source).toContain("TAIL-36");
+    expect(source).not.toContain("正文".repeat(2500));
+  });
+});
 
 const CRITICAL_ISSUE: AuditIssue = {
   severity: "critical",
@@ -463,6 +491,8 @@ describe("PipelineRunner", () => {
         .resolves.toContain("冷硬、克制、利益驱动");
       await expect(readFile(join(storyDir, "current_focus.md"), "utf-8"))
         .resolves.toContain("旧账线和港口势力网");
+      await expect(readFile(join(storyDir, "brief.md"), "utf-8"))
+        .resolves.toContain("近未来港口城");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -546,6 +576,68 @@ describe("PipelineRunner", () => {
       expect(generate.mock.calls[1]?.[0]).toContain("核心冲突");
       expect(generate.mock.calls[1]?.[0]).toContain("核心冲突不够集中");
       expect(generate.mock.calls[1]?.[0]).toContain("开篇节奏");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("honors configured foundation review retry count before accepting a rejected foundation", async () => {
+    const { root, runner, bookId } = await createRunnerFixture({
+      foundationReviewRetries: 4,
+    } as Partial<ConstructorParameters<typeof PipelineRunner>[0]>);
+    const reviewer = new FoundationReviewerAgent({
+      client: {
+        provider: "openai",
+        apiFormat: "chat",
+        stream: false,
+        defaults: {
+          temperature: 0.7,
+          thinkingBudget: 0,
+        },
+      } as ConstructorParameters<typeof PipelineRunner>[0]["client"],
+      model: "test-model",
+      projectRoot: root,
+      bookId,
+    });
+    const foundation = {
+      storyBible: "# Story Bible",
+      volumeOutline: "# Volume Outline",
+      bookRules: "---\nversion: \"1.0\"\n---\n\n# Book Rules",
+      currentState: "# Current State",
+      pendingHooks: "# Pending Hooks",
+    };
+    const generate = vi.fn(async (_reviewFeedback?: string) => foundation);
+    const reviewMock = vi.mocked(FoundationReviewerAgent.prototype.review);
+
+    reviewMock.mockReset();
+    reviewMock.mockResolvedValue({
+      passed: false,
+      totalScore: 72,
+      dimensions: [],
+      overallFeedback: "仍未达到可开写标准。",
+    });
+
+    try {
+      await (runner as unknown as {
+        generateAndReviewFoundation: (params: {
+          readonly generate: (reviewFeedback?: string) => Promise<typeof foundation>;
+          readonly reviewer: FoundationReviewerAgent;
+          readonly mode: "original";
+          readonly language: "zh";
+          readonly stageLanguage: "zh";
+        }) => Promise<typeof foundation>;
+      }).generateAndReviewFoundation({
+        generate,
+        reviewer,
+        mode: "original",
+        language: "zh",
+        stageLanguage: "zh",
+      });
+
+      expect(generate).toHaveBeenCalledTimes(5);
+      expect(reviewMock).toHaveBeenCalledTimes(5);
+      expect(generate.mock.calls[1]?.[0]).toContain("仍未达到可开写标准");
+      expect(generate.mock.calls[4]?.[0]).toContain("仍未达到可开写标准");
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -705,13 +797,14 @@ describe("PipelineRunner", () => {
     );
 
     try {
-      await runner.writeDraft(bookId, "Ignore the guild chase and bring focus back to mentor conflict.");
+      const chapterContext = "Ignore the guild chase and bring focus back to mentor conflict.";
+      await runner.writeDraft(bookId, chapterContext);
 
       expect(planChapter).toHaveBeenCalledTimes(1);
       expect(composeChapter).toHaveBeenCalledTimes(1);
 
       const writeInput = writeChapter.mock.calls[0]?.[0];
-      expect(writeInput?.externalContext).toBeUndefined();
+      expect(writeInput?.externalContext).toBe(chapterContext);
       expect(writeInput?.chapterIntent).toContain("# Chapter Intent");
       expect(writeInput?.chapterMemo).toEqual(expect.objectContaining({
         chapter: 1,
@@ -1343,10 +1436,56 @@ describe("PipelineRunner", () => {
       expect(composeChapter).toHaveBeenCalledTimes(1);
       const writeInput = writeChapter.mock.calls[0]?.[0];
       expect(writeInput?.chapterIntent).toContain("# Chapter Intent");
+      expect(writeInput?.externalContext).toBeUndefined();
       expect(writeInput?.chapterMemo).toEqual(expect.objectContaining({
         chapter: 1,
       }));
       expect(writeInput?.contextPackage?.selectedContext.length).toBeGreaterThan(0);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("passes configured writeNextChapter context through planner and governed writer input", async () => {
+    const chapterContext = "本章标题：雨夜账本\n必须围绕账本失窃后的当面对质展开。";
+    const { root, runner, state, bookId } = await createRunnerFixture({
+      inputGovernanceMode: "v2",
+      externalContext: chapterContext,
+    });
+
+    await Promise.all([
+      writeFile(join(state.bookDir(bookId), "story", "current_focus.md"), "# Current Focus\n\nBring focus back to the mentor conflict.\n", "utf-8"),
+      writeFile(join(state.bookDir(bookId), "story", "volume_outline.md"), "# Volume Outline\n\n## Chapter 1\nTrack the merchant guild trail.\n", "utf-8"),
+      writeFile(join(state.bookDir(bookId), "story", "current_state.md"), "# Current State\n\n- Lin Yue still hides the broken oath token.\n", "utf-8"),
+      writeFile(join(state.bookDir(bookId), "story", "story_bible.md"), "# Story Bible\n\n- The jade seal cannot be destroyed.\n", "utf-8"),
+      writeFile(join(state.bookDir(bookId), "story", "pending_hooks.md"), "# Pending Hooks\n\n- Why the mentor vanished after the trial.\n", "utf-8"),
+    ]);
+
+    const planChapter = vi.spyOn(PlannerAgent.prototype, "planChapter");
+    vi.spyOn(ComposerModule, "composeGovernedChapter");
+    const writeChapter = vi.spyOn(WriterAgent.prototype, "writeChapter").mockResolvedValue(
+      createWriterOutput({
+        chapterNumber: 1,
+        title: "雨夜账本",
+        content: "Governed pipeline draft.",
+        wordCount: "Governed pipeline draft.".length,
+      }),
+    );
+    vi.spyOn(ContinuityAuditor.prototype, "auditChapter").mockResolvedValue(
+      createAuditResult({
+        passed: true,
+        issues: [],
+        summary: "clean",
+      }),
+    );
+
+    try {
+      await runner.writeNextChapter(bookId, 220);
+
+      expect(planChapter.mock.calls[0]?.[0].externalContext).toBe(chapterContext);
+      const writeInput = writeChapter.mock.calls[0]?.[0];
+      expect(writeInput?.externalContext).toBe(chapterContext);
+      expect(writeInput?.chapterMemo?.goal).toBe(chapterContext);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
@@ -3080,6 +3219,23 @@ describe("PipelineRunner", () => {
       expect(await state.loadChapterIndex(bookId)).toEqual([]);
       await expect(readFile(join(state.bookDir(bookId), "story", "fanfic_canon.md"), "utf-8")).resolves.toContain("Fanfic Canon");
       await expect(stat(join(state.bookDir(bookId), "story", "snapshots", "0"))).resolves.toBeTruthy();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("imports short style samples with a deterministic guide instead of failing", async () => {
+    const { root, runner, state, bookId } = await createRunnerFixture();
+    const chatSpy = vi.spyOn(llmProvider, "chatCompletion").mockRejectedValue(new Error("should not call llm for short samples"));
+    const sample = "夜雨落在窗台。她没回头，只把那封信压进抽屉。楼下车灯一闪，像有人终于找到了这里。";
+
+    try {
+      const guide = await runner.generateStyleGuide(bookId, sample, "short-snippet");
+
+      expect(chatSpy).not.toHaveBeenCalled();
+      expect(guide).toContain("样本文本较短");
+      await expect(readFile(join(state.bookDir(bookId), "story", "style_profile.json"), "utf-8")).resolves.toContain("short-snippet");
+      await expect(readFile(join(state.bookDir(bookId), "story", "style_guide.md"), "utf-8")).resolves.toContain("样本文本较短");
     } finally {
       await rm(root, { recursive: true, force: true });
     }

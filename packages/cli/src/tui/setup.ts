@@ -9,9 +9,22 @@ import {
   brightCyan, brightGreen, brightWhite,
 } from "./ansi.js";
 import { resolveTuiLocale, type TuiLocale } from "./i18n.js";
-import { GLOBAL_ENV_PATH } from "../utils.js";
+import { GLOBAL_ENV_PATH, loadConfig } from "../utils.js";
+import { ensureProjectGitignore } from "../project-bootstrap.js";
 
 const PROVIDERS = ["openai", "anthropic", "custom"] as const;
+type SetupProvider = typeof PROVIDERS[number];
+
+export function resolveSetupProvider(provider: string, baseUrl: string): SetupProvider {
+  const normalizedProvider = PROVIDERS.includes(provider.trim() as SetupProvider)
+    ? provider.trim() as SetupProvider
+    : "openai";
+  const normalizedUrl = baseUrl.trim().toLowerCase();
+  if (normalizedUrl.includes("api.kimi.com/coding")) {
+    return "anthropic";
+  }
+  return normalizedProvider;
+}
 
 interface SetupResult {
   readonly projectRoot: string;
@@ -159,9 +172,9 @@ export async function interactiveLlmSetup(
     console.log(`  ${c("1", cyan)}  ${c(copy.steps.provider, gray)}`);
     console.log(c(`     ${copy.hints.provider}`, dim));
     const providerInput = await rl.question(`     ${c("❯", cyan)} `);
-    const provider = PROVIDERS.includes(providerInput.trim() as typeof PROVIDERS[number])
-      ? providerInput.trim()
-      : copy.defaults.provider;
+    const provider = PROVIDERS.includes(providerInput.trim() as SetupProvider)
+      ? providerInput.trim() as SetupProvider
+      : copy.defaults.provider as SetupProvider;
     console.log(`     ${c("✓", brightGreen)} ${provider}`);
     console.log();
 
@@ -193,9 +206,10 @@ export async function interactiveLlmSetup(
     console.log(c(`     ${copy.hints.scope}`, dim));
     const scope = await rl.question(`     ${c("❯", cyan)} ${c(copy.defaults.scope, dim)} `);
     const useGlobal = scope.trim().toLowerCase() !== "project";
+    const finalProvider = resolveSetupProvider(provider, baseUrl);
 
     const envContent = [
-      `INKOS_LLM_PROVIDER=${provider}`,
+      `INKOS_LLM_PROVIDER=${finalProvider}`,
       `INKOS_LLM_BASE_URL=${baseUrl.trim()}`,
       `INKOS_LLM_API_KEY=${apiKey.trim()}`,
       `INKOS_LLM_MODEL=${model.trim()}`,
@@ -268,11 +282,7 @@ async function autoInit(cwd: string): Promise<void> {
     );
   }
 
-  await writeFile(
-    join(cwd, ".gitignore"),
-    [".env", "node_modules/", ".DS_Store"].join("\n"),
-    "utf-8",
-  );
+  await ensureProjectGitignore(cwd);
 
   console.log(`  ${c("✓", brightGreen, bold)} ${c(messages.initialized, dim)}`);
 }
@@ -304,6 +314,20 @@ export interface ModelInfo {
 }
 
 export async function detectModelInfo(projectRoot: string): Promise<ModelInfo | undefined> {
+  try {
+    const config = await loadConfig({ requireApiKey: false, projectRoot });
+    const service = config.llm.service?.trim();
+    const provider = service || config.llm.provider || "openai";
+    const model = config.llm.model?.trim() || "unknown";
+    return {
+      provider,
+      model,
+      baseUrl: config.llm.baseUrl ?? "",
+    };
+  } catch {
+    // Fall back to legacy env parsing below.
+  }
+
   const paths = [join(projectRoot, ".env"), GLOBAL_ENV_PATH];
   for (const p of paths) {
     const info = await parseEnvModel(p);

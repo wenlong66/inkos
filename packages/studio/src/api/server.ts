@@ -30,8 +30,10 @@ import {
   loadSecrets,
   saveSecrets,
   listModelsForService,
+  isApiKeyOptionalForEndpoint,
   getAllEndpoints,
   probeModelsFromUpstream,
+  fetchWithProxy,
   chatCompletion,
   buildExportArtifact,
   GLOBAL_ENV_PATH,
@@ -140,6 +142,65 @@ function extractToolError(result: unknown): string {
     }
   }
   return String(result).slice(0, 500);
+}
+
+function isLikelyFailedToolResult(exec: CollectedToolExec): boolean {
+  if (exec.status === "error") return true;
+  const text = `${exec.error ?? ""}\n${exec.result ?? ""}`.toLowerCase();
+  return /\bfailed\b|\berror\b|失败|异常|出错/.test(text);
+}
+
+function hasSuccessfulSubAgentExec(
+  execs: ReadonlyArray<CollectedToolExec>,
+  agent: string,
+): boolean {
+  return execs.some((exec) =>
+    exec.tool === "sub_agent"
+    && exec.agent === agent
+    && exec.status === "completed"
+    && !isLikelyFailedToolResult(exec)
+  );
+}
+
+function isWriteNextInstruction(instruction: string): boolean {
+  const trimmed = instruction.trim();
+  return /^(continue|继续|继续写|写下一章|write next|下一章|再来一章)$/i.test(trimmed)
+    || /(继续写|写下一章|下一章|再来一章|write\s+next)/i.test(trimmed);
+}
+
+function looksLikeBookCreatedClaim(responseText: string): boolean {
+  return /(?:已|已经|成功).{0,12}(?:创建|建书|初始化|保存).{0,12}(?:作品|书|书籍|文件夹)?/.test(responseText)
+    || /\b(?:created|initiali[sz]ed|saved)\b.{0,40}\b(?:book|project|novel)\b/i.test(responseText);
+}
+
+function validateAgentActionExecution(args: {
+  readonly instruction: string;
+  readonly agentBookId: string | null | undefined;
+  readonly responseText: string;
+  readonly collectedToolExecs: ReadonlyArray<CollectedToolExec>;
+}): string | undefined {
+  const failedExec = args.collectedToolExecs.find(isLikelyFailedToolResult);
+  if (failedExec) {
+    return `${failedExec.label} 执行失败：${failedExec.error ?? failedExec.result ?? "未知错误"}`;
+  }
+
+  if (
+    args.agentBookId
+    && isWriteNextInstruction(args.instruction)
+    && !hasSuccessfulSubAgentExec(args.collectedToolExecs, "writer")
+  ) {
+    return "模型声称已完成下一章，但没有实际调用写作工具。请重试；如果仍失败，请检查模型是否支持工具调用。";
+  }
+
+  if (
+    !args.agentBookId
+    && looksLikeBookCreatedClaim(args.responseText)
+    && !resolveCreatedBookIdFromToolExecs(args.collectedToolExecs)
+  ) {
+    return "模型声称已创建作品，但没有实际调用建书工具，也没有生成作品文件。请补充书名/题材后重试，或换用支持工具调用的模型。";
+  }
+
+  return undefined;
 }
 
 interface CollectedToolExec {
@@ -515,7 +576,7 @@ function formatServiceProbeError(args: {
     ].filter(Boolean).join("\n");
   }
 
-  if (args.service === "moonshot" || args.service === "kimiCodingPlan") {
+  if (args.service === "moonshot" || args.service === "kimiCodingPlan" || args.service === "kimicode") {
     return [
       `${args.label ?? args.service} 测试连接失败。`,
       context,
@@ -538,6 +599,7 @@ async function fetchModelsFromServiceBaseUrl(
   serviceId: string,
   baseUrl: string,
   apiKey: string,
+  proxyUrl?: string,
 ): Promise<{ models: Array<{ id: string; name: string }>; error?: string; authFailed?: boolean }> {
   const endpoint = isCustomServiceId(serviceId)
     ? undefined
@@ -547,10 +609,10 @@ async function fetchModelsFromServiceBaseUrl(
     : endpoint?.modelsBaseUrl ?? (endpoint ? baseUrl : resolveServiceModelsBaseUrl(serviceId) ?? baseUrl);
   const modelsUrl = modelsBaseUrl.replace(/\/$/, "") + "/models";
   try {
-    const res = await fetch(modelsUrl, {
+    const res = await fetchWithProxy(modelsUrl, {
       headers: { Authorization: `Bearer ${apiKey}` },
       signal: AbortSignal.timeout(10_000),
-    });
+    }, proxyUrl);
     if (!res.ok) {
       const body = await res.text().catch(() => "");
       return {
@@ -579,6 +641,7 @@ async function probeServiceCapabilities(args: {
   preferredApiFormat?: "chat" | "responses";
   preferredStream?: boolean;
   preferredModel?: string;
+  proxyUrl?: string;
 }): Promise<ServiceProbeResult> {
   const rawConfig = await loadRawConfig(args.root).catch(() => ({} as Record<string, unknown>));
   const llm = (rawConfig.llm as Record<string, unknown> | undefined) ?? {};
@@ -590,7 +653,7 @@ async function probeServiceCapabilities(args: {
       : null;
 
   const baseService = isCustomServiceId(args.service) ? "custom" : args.service;
-  const modelsResponse = await fetchModelsFromServiceBaseUrl(baseService, args.baseUrl, args.apiKey);
+  const modelsResponse = await fetchModelsFromServiceBaseUrl(baseService, args.baseUrl, args.apiKey, args.proxyUrl);
   if (modelsResponse.authFailed) {
     return {
       ok: false,
@@ -599,14 +662,22 @@ async function probeServiceCapabilities(args: {
     };
   }
   const discoveredModels = modelsResponse.models;
-  // For bank services, probe with the service's own check model first — not the global default.
   const endpoint = getAllEndpoints().find((ep) => ep.id === baseService);
   const preset = resolveServicePreset(baseService);
+  const discoveredFirstModel =
+    discoveredModels.find((model) => isTextChatModelId(model.id))?.id
+    ?? discoveredModels[0]?.id;
+  // Prefer live /models results; if unavailable, probe with the service's own check model before global defaults.
   const serviceFirstModel =
-    endpoint?.checkModel
+    discoveredFirstModel
+    ?? endpoint?.checkModel
     ?? preset?.knownModels?.[0]
     ?? endpoint?.models.find((model) => model.enabled !== false)?.id;
-  const useEndpointCheckModel = !isCustomServiceId(args.service) && Boolean(endpoint?.checkModel);
+  const useDynamicLocalModels = baseService === "ollama";
+  const useEndpointCheckModel = !useDynamicLocalModels
+    && !isCustomServiceId(args.service)
+    && discoveredModels.length === 0
+    && Boolean(endpoint?.checkModel);
   const configService = typeof llm.service === "string" ? llm.service : undefined;
   const configModel = !useEndpointCheckModel && configService === args.service
     ? typeof llm.defaultModel === "string"
@@ -646,6 +717,7 @@ async function probeServiceCapabilities(args: {
         temperature: 0.7,
         maxTokens: 2048,
         thinkingBudget: 0,
+        proxyUrl: args.proxyUrl,
         apiFormat: plan.apiFormat,
         stream: plan.stream,
       } as ProjectConfig["llm"]);
@@ -704,6 +776,11 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     if (error instanceof ApiError) {
       return c.json({ error: { code: error.code, message: error.message } }, error.status as 400);
     }
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.includes("LLM API key not set") || message.includes("INKOS_LLM_API_KEY not set")) {
+      return c.json({ error: { code: "LLM_CONFIG_ERROR", message } }, 400);
+    }
+    console.error("[studio] Unexpected server error", error);
     return c.json(
       { error: { code: "INTERNAL_ERROR", message: "Unexpected server error." } },
       500,
@@ -776,6 +853,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
       model: overrides?.model ?? currentConfig.llm.model,
       projectRoot: root,
       defaultLLMConfig: currentConfig.llm,
+      foundationReviewRetries: currentConfig.foundation?.reviewRetries ?? 2,
       modelOverrides: currentConfig.modelOverrides,
       notifyChannels: currentConfig.notify,
       logger,
@@ -840,6 +918,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
       platform?: string;
       chapterWordCount?: number;
       targetChapters?: number;
+      blurb?: string;
     }>();
 
     const now = new Date().toISOString();
@@ -870,6 +949,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
         platform: body.platform,
         chapterWordCount: body.chapterWordCount,
         targetChapters: body.targetChapters,
+        blurb: body.blurb,
       },
       tools,
     }).then(
@@ -1208,6 +1288,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     const envConfig = await readEnvConfigStatus(root);
     return c.json({
       services,
+      service: typeof llm.service === "string" ? llm.service : null,
       defaultModel: llm.defaultModel ?? null,
       configSource: "studio" satisfies LLMConfigSource,
       storedConfigSource: normalizeConfigSource(llm.configSource),
@@ -1252,22 +1333,30 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
       stream?: boolean;
     }>();
 
-    if (!apiKey?.trim()) {
-      return c.json({ ok: false, error: "API Key 不能为空" }, 400);
-    }
-
     const resolvedBaseUrl = await resolveConfiguredServiceBaseUrl(root, service, baseUrl);
     if (!resolvedBaseUrl) {
       return c.json({ ok: false, error: `未知服务商: ${service}` }, 400);
     }
 
+    const baseService = isCustomServiceId(service) ? "custom" : service;
+    const apiKeyOptional = isApiKeyOptionalForEndpoint({
+      provider: resolveServiceProviderFamily(baseService) ?? "openai",
+      baseUrl: resolvedBaseUrl,
+    });
+    if (!apiKey?.trim() && !apiKeyOptional) {
+      return c.json({ ok: false, error: "API Key 不能为空" }, 400);
+    }
+
+    const rawConfig = await loadRawConfig(root).catch(() => ({} as Record<string, unknown>));
+    const llm = (rawConfig.llm as Record<string, unknown> | undefined) ?? {};
     const probe = await probeServiceCapabilities({
       root,
       service,
-      apiKey: apiKey.trim(),
+      apiKey: apiKey?.trim() ?? "",
       baseUrl: resolvedBaseUrl,
       preferredApiFormat: apiFormat,
       preferredStream: stream,
+      proxyUrl: typeof llm.proxyUrl === "string" ? llm.proxyUrl : undefined,
     });
 
     // B12: 升级响应 shape 为 { probe, chat, ... }，同时保留老字段供 UI 过渡期兼容
@@ -1381,10 +1470,15 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     const secrets = await loadSecrets(root);
     const apiKey = c.req.query("apiKey") || secrets.services[service]?.apiKey || "";
 
-    // No key = no models
-    if (!apiKey) return c.json({ models: [] });
-
     const resolvedBaseUrl = await resolveConfiguredServiceBaseUrl(root, service);
+    const baseService = isCustomServiceId(service) ? "custom" : service;
+    const apiKeyOptional = isApiKeyOptionalForEndpoint({
+      provider: resolveServiceProviderFamily(baseService) ?? "openai",
+      baseUrl: resolvedBaseUrl,
+    });
+
+    // No key = no models, except local/self-hosted endpoints such as Ollama.
+    if (!apiKey && !apiKeyOptional) return c.json({ models: [] });
 
     // Cache by service + resolved baseUrl + apiKey fingerprint; valid for 10 min unless ?refresh=1
     const cacheKey = `${service}::${resolvedBaseUrl ?? ""}::${apiKey.slice(-8)}`;
@@ -1810,12 +1904,12 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
       // Create pipeline with resolved model (so sub_agent tools use the frontend-selected model)
       // Don't spread config.llm — its baseUrl/provider belong to the old service.
       // Let createLLMClient resolve baseUrl from the service preset.
-      const pipelineClient = (reqService && reqModel && resolvedApiKey)
+      const pipelineClient = (reqService && reqModel && resolvedModel)
         ? createLLMClient({
             ...config.llm,
             service: configuredEntry?.service ?? reqService,
             model: reqModel,
-            apiKey: resolvedApiKey,
+            apiKey: resolvedApiKey ?? "",
             ...(configuredEntry?.apiFormat ? { apiFormat: configuredEntry.apiFormat } : {}),
             ...(configuredEntry?.stream !== undefined ? { stream: configuredEntry.stream } : {}),
             baseUrl: configuredEntry?.baseUrl ?? "",
@@ -1827,6 +1921,86 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
         currentConfig: config,
         sessionIdForSSE: bookSession.sessionId,
       }));
+
+      if (agentBookId && isWriteNextInstruction(instruction)) {
+        const toolCallId = `direct-writer-${Date.now().toString(36)}`;
+        const toolArgs = { agent: "writer", bookId: agentBookId };
+        broadcast("tool:start", {
+          sessionId: streamSessionId,
+          id: toolCallId,
+          tool: "sub_agent",
+          args: toolArgs,
+          stages: PIPELINE_STAGES.writer,
+        });
+
+        try {
+          const writeResult = await pipeline.writeNextChapter(agentBookId);
+          const responseText = [
+            `已为 ${agentBookId} 完成第 ${writeResult.chapterNumber} 章`,
+            writeResult.title ? `《${writeResult.title}》` : "",
+            `，字数 ${writeResult.wordCount}，状态 ${writeResult.status}。`,
+          ].join("");
+          const toolResult = {
+            content: [{ type: "text", text: responseText }],
+            details: {
+              kind: "chapter_written",
+              bookId: agentBookId,
+              chapterNumber: writeResult.chapterNumber,
+              title: writeResult.title,
+              wordCount: writeResult.wordCount,
+              status: writeResult.status,
+            },
+          };
+          broadcast("tool:end", {
+            sessionId: streamSessionId,
+            id: toolCallId,
+            tool: "sub_agent",
+            result: toolResult,
+            isError: false,
+          });
+          await appendManualSessionMessages(root, bookSession.sessionId, [{
+            role: "assistant",
+            content: [{ type: "text", text: responseText }],
+            api: "anthropic-messages",
+            provider: configuredEntry?.service ?? reqService ?? config.llm.provider,
+            model: reqModel ?? config.llm.model,
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+            stopReason: "toolUse",
+            timestamp: Date.now(),
+          }], instruction);
+          await refreshBookSessionFromTranscript();
+          broadcast("agent:complete", { instruction, activeBookId: agentBookId, sessionId: bookSession.sessionId });
+          return c.json({
+            response: responseText,
+            session: {
+              sessionId: bookSession.sessionId,
+              activeBookId: agentBookId,
+            },
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          const toolResult = { content: [{ type: "text", text: message }] };
+          broadcast("tool:end", {
+            sessionId: streamSessionId,
+            id: toolCallId,
+            tool: "sub_agent",
+            result: toolResult,
+            isError: true,
+          });
+          broadcast("agent:error", { instruction, activeBookId: agentBookId, sessionId: bookSession.sessionId, error: message });
+          return c.json({
+            error: { code: "AGENT_ACTION_FAILED", message },
+            response: message,
+          }, 502);
+        }
+      }
 
       // Run pi-agent session
       const collectedToolExecs: CollectedToolExec[] = [];
@@ -1932,6 +2106,21 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
         instruction,
       );
 
+      if (result.responseText) {
+        const actionExecutionError = validateAgentActionExecution({
+          instruction,
+          agentBookId,
+          responseText: result.responseText,
+          collectedToolExecs,
+        });
+        if (actionExecutionError) {
+          return c.json({
+            error: { code: "AGENT_ACTION_NOT_EXECUTED", message: actionExecutionError },
+            response: actionExecutionError,
+          }, 502);
+        }
+      }
+
       let broadcastedCreatedBookId: string | null = null;
       const finalizeCreatedBook = async (): Promise<string | null> => {
         if (agentBookId) return null;
@@ -1992,6 +2181,18 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
             { maxTokens: 256 },
           );
           if (fallback.content?.trim()) {
+            const actionExecutionError = validateAgentActionExecution({
+              instruction,
+              agentBookId,
+              responseText: fallback.content,
+              collectedToolExecs,
+            });
+            if (actionExecutionError) {
+              return c.json({
+                error: { code: "AGENT_ACTION_NOT_EXECUTED", message: actionExecutionError },
+                response: actionExecutionError,
+              }, 502);
+            }
             await appendManualSessionMessages(root, bookSession.sessionId, [{
               role: "assistant",
               content: [{ type: "text", text: fallback.content }],
@@ -2613,6 +2814,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
   app.post("/api/v1/books/:id/style/import", async (c) => {
     const id = c.req.param("id");
     const { text, sourceName } = await c.req.json<{ text: string; sourceName: string }>();
+    if (!text?.trim()) return c.json({ error: "text is required" }, 400);
 
     broadcast("style:start", { bookId: id });
     try {
@@ -2787,6 +2989,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
         preferredApiFormat: currentConfig.llm.apiFormat,
         preferredStream: currentConfig.llm.stream,
         preferredModel: currentConfig.llm.model,
+        proxyUrl: currentConfig.llm.proxyUrl,
       });
       checks.llmConnected = probe.ok;
     } catch { /* ignore */ }

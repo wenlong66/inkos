@@ -205,6 +205,18 @@ describe("chatCompletion via pi-ai", () => {
     expect(error.message).toContain("无法连接到 API 服务");
   });
 
+  it("retries transient socket termination errors before failing the chapter pipeline", async () => {
+    mockStreamSimple
+      .mockReturnValueOnce(makeErrorStream("terminated: UND_ERR_SOCKET other side closed"))
+      .mockReturnValueOnce(makeTextStream("recovered"));
+
+    const client = makeClient();
+    const result = await chatCompletion(client, "test-model", [{ role: "user", content: "ping" }]);
+
+    expect(result.content).toBe("recovered");
+    expect(mockStreamSimple).toHaveBeenCalledTimes(2);
+  });
+
   it("passes temperature and maxTokens to streamSimple", async () => {
     mockStreamSimple.mockReturnValue(makeTextStream("ok"));
 
@@ -288,6 +300,180 @@ describe("chatCompletion via pi-ai", () => {
     vi.unstubAllGlobals();
   });
 
+  it("does not leave a stream monitor timer after native non-stream chat", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { content: "你好！" } }],
+        usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = makeClient(0.7, {
+      service: "custom",
+      stream: false,
+      _piModel: {
+        ...MOCK_PI_MODEL,
+        provider: "openai",
+        baseUrl: "https://gateway.example/v1",
+      },
+    });
+    const result = await chatCompletion(client, "gpt-5.4", [{ role: "user", content: "nihao" }], {
+      onStreamProgress: vi.fn(),
+    });
+
+    expect(result.content).toBe("你好！");
+    expect(vi.getTimerCount()).toBe(0);
+
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it("attaches a proxy dispatcher for custom openai-compatible chat when proxyUrl is configured", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { content: "proxied" } }],
+        usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = makeClient(0.7, {
+      service: "custom",
+      stream: false,
+      proxyUrl: "http://127.0.0.1:9910",
+      _piModel: {
+        ...MOCK_PI_MODEL,
+        provider: "openai",
+        baseUrl: "https://gateway.example/v1",
+      },
+    });
+    const result = await chatCompletion(client, "gpt-5.4", [{ role: "user", content: "nihao" }]);
+
+    expect(result.content).toBe("proxied");
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({
+      method: "POST",
+      dispatcher: expect.any(Object),
+    });
+
+    vi.unstubAllGlobals();
+  });
+
+  it("uses reasoning_content for custom openai-compatible non-stream responses that omit content", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { reasoning_content: "推理通道文本" } }],
+        usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = makeClient(0.7, {
+      service: "custom",
+      stream: false,
+      _piModel: {
+        ...MOCK_PI_MODEL,
+        provider: "openai",
+        baseUrl: "https://gateway.example/v1",
+      },
+    });
+    const result = await chatCompletion(client, "glm-compat", [{ role: "user", content: "nihao" }]);
+
+    expect(result.content).toBe("推理通道文本");
+    expect(fetchMock).toHaveBeenCalledOnce();
+
+    vi.unstubAllGlobals();
+  });
+
+  it("uses reasoning_content for custom openai-compatible streams that omit content deltas", async () => {
+    const encoder = new TextEncoder();
+    const sse = [
+      "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"你\"}}]}\n\n",
+      "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"好\"}}]}\n\n",
+      "data: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5}}\n\n",
+      "data: [DONE]\n\n",
+    ].join("");
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode(sse));
+          controller.close();
+        },
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = makeClient(0.7, {
+      service: "custom",
+      stream: true,
+      _piModel: {
+        ...MOCK_PI_MODEL,
+        provider: "openai",
+        baseUrl: "https://gateway.example/v1",
+      },
+    });
+    const result = await chatCompletion(client, "glm-compat", [{ role: "user", content: "nihao" }]);
+
+    expect(result.content).toBe("你好");
+    expect(result.usage.totalTokens).toBe(5);
+    expect(fetchMock).toHaveBeenCalledOnce();
+
+    vi.unstubAllGlobals();
+  });
+
+  it("retries custom openai-compatible chat by folding system messages into user when system role is unsupported", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 400,
+        statusText: "Bad Request",
+        text: async () => JSON.stringify({ error: { message: "role system is unsupported" } }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          choices: [{ message: { content: "ok" } }],
+          usage: { prompt_tokens: 9, completion_tokens: 1, total_tokens: 10 },
+        }),
+      });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = makeClient(0.7, {
+      service: "custom",
+      stream: false,
+      _piModel: {
+        ...MOCK_PI_MODEL,
+        provider: "openai",
+        baseUrl: "https://gateway.example/v1",
+      },
+    });
+    const result = await chatCompletion(client, "wild-compatible", [
+      { role: "system", content: "只输出中文。" },
+      { role: "user", content: "ping" },
+    ]);
+
+    expect(result.content).toBe("ok");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const firstBody = JSON.parse(fetchMock.mock.calls[0]?.[1]?.body as string);
+    const secondBody = JSON.parse(fetchMock.mock.calls[1]?.[1]?.body as string);
+    expect(firstBody.messages).toEqual([
+      { role: "system", content: "只输出中文。" },
+      { role: "user", content: "ping" },
+    ]);
+    expect(secondBody.messages).toHaveLength(1);
+    expect(secondBody.messages[0]).toMatchObject({ role: "user" });
+    expect(secondBody.messages[0].content).toContain("只输出中文。");
+    expect(secondBody.messages[0].content).toContain("ping");
+
+    vi.unstubAllGlobals();
+  });
+
   it("keeps legacy env custom openai-compatible chat on pi-ai path", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
@@ -309,6 +495,68 @@ describe("chatCompletion via pi-ai", () => {
     expect(result.content).toBe("legacy ok");
     expect(mockCompleteSimple).toHaveBeenCalledOnce();
     expect(fetchMock).not.toHaveBeenCalled();
+
+    vi.unstubAllGlobals();
+  });
+
+  it("uses native fetch transport for local Ollama without an API key", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { content: "本地 Ollama 可用" } }],
+        usage: { prompt_tokens: 3, completion_tokens: 4, total_tokens: 7 },
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = makeClient(0.7, {
+      service: "ollama",
+      configSource: "env",
+      stream: false,
+      _apiKey: "",
+      _piModel: {
+        ...MOCK_PI_MODEL,
+        provider: "ollama",
+        baseUrl: "http://127.0.0.1:11434/v1",
+      },
+    });
+    const result = await chatCompletion(client, "Qwen3.6-35B-A3B-APEX-I-Mini.gguf", [
+      { role: "user", content: "ping" },
+    ]);
+
+    expect(result.content).toBe("本地 Ollama 可用");
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(mockCompleteSimple).not.toHaveBeenCalled();
+
+    vi.unstubAllGlobals();
+  });
+
+  it("uses native fetch transport for local custom OpenAI-compatible endpoints without an API key", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        choices: [{ message: { content: "本地自定义端点可用" } }],
+        usage: { prompt_tokens: 5, completion_tokens: 6, total_tokens: 11 },
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const client = makeClient(0.7, {
+      service: "custom",
+      configSource: "env",
+      stream: false,
+      _apiKey: "",
+      _piModel: {
+        ...MOCK_PI_MODEL,
+        provider: "openai",
+        baseUrl: "http://127.0.0.1:11434/v1",
+      },
+    });
+    const result = await chatCompletion(client, "local-qwen", [{ role: "user", content: "ping" }]);
+
+    expect(result.content).toBe("本地自定义端点可用");
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(mockCompleteSimple).not.toHaveBeenCalled();
 
     vi.unstubAllGlobals();
   });
@@ -501,6 +749,7 @@ describe("createLLMClient per-call maxTokens not capped (v2.0.0)", () => {
       provider: "openai",
       baseUrl: "http://localhost:0",
       model: "test-model",
+      apiKey: "test-key",
     }));
 
     mockStreamSimple.mockReset();

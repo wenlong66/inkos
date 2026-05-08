@@ -1,3 +1,5 @@
+import { fetchWithProxy } from "../../utils/proxy-fetch.js";
+
 /**
  * 通用 OpenAI 兼容 /models 探针。
  * 任何失败（网络错、超时、非 JSON、非 2xx）一律返回空数组，不抛异常。
@@ -14,11 +16,11 @@ export async function probeModelsFromUpstream(
   apiKey: string,
   timeoutMs = 10_000,
 ): Promise<ReadonlyArray<ProbedModel>> {
-  if (!baseUrl || !apiKey) return [];
+  if (!baseUrl) return [];
   try {
     const modelsUrl = baseUrl.replace(/\/$/, "") + "/models";
-    const res = await fetch(modelsUrl, {
-      headers: { Authorization: `Bearer ${apiKey}` },
+    const res = await fetchWithProxy(modelsUrl, {
+      headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
       signal: AbortSignal.timeout(timeoutMs),
     });
     if (!res.ok) return [];

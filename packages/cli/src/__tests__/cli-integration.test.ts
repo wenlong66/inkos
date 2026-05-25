@@ -196,6 +196,15 @@ describe("CLI integration", () => {
       const config = JSON.parse(raw);
       expect(config.inputGovernanceMode).toBe("v2");
     });
+
+    it("sets long-form writing review retries", async () => {
+      const output = run(["config", "set", "writing.reviewRetries", "3"]);
+      expect(output).toContain("Set writing.reviewRetries = 3");
+
+      const raw = await readFile(join(projectDir, "inkos.json"), "utf-8");
+      const config = JSON.parse(raw);
+      expect(config.writing.reviewRetries).toBe(3);
+    });
   });
 
   describe("inkos config show", () => {

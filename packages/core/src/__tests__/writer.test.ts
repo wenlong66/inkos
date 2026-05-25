@@ -101,6 +101,67 @@ describe("WriterAgent", () => {
     expect(prompt).toContain("当面对质");
   });
 
+  it("caps oversized legacy truth files in creative prompts", () => {
+    const agent = new WriterAgent({
+      client: {
+        provider: "openai",
+        apiFormat: "chat",
+        stream: false,
+        defaults: {
+          temperature: 0.7,
+          maxTokens: 4096,
+          thinkingBudget: 0,
+          extra: {},
+        },
+      },
+      model: "test-model",
+      projectRoot: "/tmp/inkos-writer-context-budget-test",
+    });
+    const oversizedStoryBible = [
+      "BEGIN-STORY",
+      "旧设定。".repeat(4000),
+      "MIDDLE-MARKER",
+      "近期设定。".repeat(4000),
+      "LATEST-STORY",
+    ].join("\n");
+
+    const prompt = (agent as unknown as {
+      buildUserPrompt(params: {
+        readonly chapterNumber: number;
+        readonly storyBible: string;
+        readonly currentState: string;
+        readonly ledger: string;
+        readonly hooks: string;
+        readonly recentChapters: string;
+        readonly lengthSpec: ReturnType<typeof buildLengthSpec>;
+        readonly chapterSummaries: string;
+        readonly subplotBoard: string;
+        readonly emotionalArcs: string;
+        readonly characterMatrix: string;
+        readonly language?: "zh" | "en";
+      }): string;
+    }).buildUserPrompt({
+      chapterNumber: 88,
+      storyBible: oversizedStoryBible,
+      currentState: "(文件尚未创建)",
+      ledger: "",
+      hooks: "(文件尚未创建)",
+      recentChapters: "",
+      lengthSpec: buildLengthSpec(1200, "zh"),
+      chapterSummaries: "(文件尚未创建)",
+      subplotBoard: "(文件尚未创建)",
+      emotionalArcs: "(文件尚未创建)",
+      characterMatrix: "(文件尚未创建)",
+      language: "zh",
+    });
+
+    expect(prompt).toContain("BEGIN-STORY");
+    expect(prompt).toContain("LATEST-STORY");
+    expect(prompt).toContain("InkOS context budget");
+    expect(prompt).toContain("story_bible");
+    expect(prompt).not.toContain("MIDDLE-MARKER");
+  });
+
   it("uses compact summary context plus selected long-range evidence during governed settlement", async () => {
     const root = await mkdtemp(join(tmpdir(), "inkos-writer-test-"));
     const bookDir = join(root, "book");

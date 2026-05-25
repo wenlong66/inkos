@@ -70,10 +70,10 @@ describe("providers structural integrity", () => {
     expect(ids).not.toContain("qwen");
   });
 
-  it("B1：中国原厂批次 1 全部收录（10 个）", () => {
+  it("B1：中国原厂批次 1 全部收录（9 个，PPIO 默认入口已下架）", () => {
     const ids = getAllEndpoints().map((p) => p.id);
     for (const id of [
-      "moonshot", "zhipu", "siliconcloud", "ppio", "bailian",
+      "moonshot", "zhipu", "siliconcloud", "bailian",
       "volcengine", "hunyuan", "baichuan", "stepfun", "wenxin",
     ]) {
       expect(ids).toContain(id);
@@ -85,9 +85,9 @@ describe("providers structural integrity", () => {
     expect(getEndpoint("bailian")?.baseUrl).toContain("/anthropic");
   });
 
-  it("B1：minimax 保留 anthropic-messages api（例外）", () => {
-    expect(getEndpoint("minimax")?.api).toBe("anthropic-messages");
-    expect(getEndpoint("minimax")?.baseUrl).toContain("/anthropic");
+  it("B1：minimax 使用 OpenAI-compatible chat endpoint", () => {
+    expect(getEndpoint("minimax")?.api).toBe("openai-completions");
+    expect(getEndpoint("minimax")?.baseUrl).toBe("https://api.minimaxi.com/v1");
   });
 
   it("B2：中国原厂批次 2 全部收录（6 个）", () => {
@@ -97,17 +97,20 @@ describe("providers structural integrity", () => {
     }
   });
 
-  it("B3：中国原厂批次 3 全部收录（6 个，R5 已删 higress）", () => {
+  it("B3：中国原厂批次 3 保留公开服务列表中的原厂入口（R5 已删 higress）", () => {
     const ids = getAllEndpoints().map((p) => p.id);
-    for (const id of ["modelscope", "giteeai", "qiniu", "infiniai", "zeroone", "ai360"]) {
+    for (const id of ["zeroone", "ai360"]) {
       expect(ids).toContain(id);
+    }
+    for (const id of ["modelscope", "giteeai", "qiniu", "infiniai"]) {
+      expect(ids).not.toContain(id);
     }
     expect(ids).not.toContain("higress");
   });
 
-  it("B4：海外/本地/自定义/聚合/GH 全部收录（7 个）", () => {
+  it("B4：海外/本地/自定义/聚合/GH 全部收录（8 个）", () => {
     const ids = getAllEndpoints().map((p) => p.id);
-    for (const id of ["ollama", "openrouter", "custom", "mistral", "xai", "newapi", "githubCopilot"]) {
+    for (const id of ["ollama", "openrouter", "custom", "mistral", "xai", "newapi", "githubCopilot", "kkaiapi"]) {
       expect(ids).toContain(id);
     }
   });
@@ -117,9 +120,9 @@ describe("providers structural integrity", () => {
     expect(getEndpoint("newapi")?.baseUrl).toBe("");
   });
 
-  it("B4：总 provider 数 = 34（不含 CodingPlan 分组，R5 删 qwen / higress 后）", () => {
+  it("B4：总 provider 数 = 30（不含 CodingPlan 分组，R5 删 qwen / higress 且精简聚合入口后）", () => {
     const nonCoding = getAllEndpoints().filter((p) => p.group !== "codingPlan");
-    expect(nonCoding.length).toBe(34);
+    expect(nonCoding.length).toBe(30);
   });
 
   it("B6：CodingPlan 8 个 provider 全部收录", () => {
@@ -133,8 +136,8 @@ describe("providers structural integrity", () => {
     }
   });
 
-  it("B6：总 provider 数 = 42 (34 base + 8 CodingPlan)", () => {
-    expect(getAllEndpoints().length).toBe(42);
+  it("B6：总 provider 数 = 38 (30 base + 8 CodingPlan)", () => {
+    expect(getAllEndpoints().length).toBe(38);
   });
 
   it("B6：CodingPlan provider 都走 anthropic-messages", () => {

@@ -20,7 +20,14 @@ import type { ChapterIntent, ChapterMemo, ContextPackage, RuleStack } from "../m
 import type { LengthSpec } from "../models/length-governance.js";
 import type { RuntimeStateDelta } from "../models/runtime-state.js";
 import { buildLengthSpec, countChapterLength } from "../utils/length-metrics.js";
-import { filterHooks, filterSummaries, filterSubplots, filterEmotionalArcs, filterCharacterMatrix } from "../utils/context-filter.js";
+import {
+  capContextBlock,
+  filterHooks,
+  filterSummaries,
+  filterSubplots,
+  filterEmotionalArcs,
+  filterCharacterMatrix,
+} from "../utils/context-filter.js";
 import { buildGovernedMemoryEvidenceBlocks } from "../utils/governed-context.js";
 import {
   buildGovernedCharacterMatrixWorkingSet,
@@ -43,6 +50,19 @@ import {
 } from "../utils/narrative-control.js";
 import { readFile, writeFile, mkdir, readdir } from "node:fs/promises";
 import { join } from "node:path";
+
+const LEGACY_WRITER_CONTEXT_BUDGET = {
+  storyBible: 14_000,
+  currentState: 7_000,
+  ledger: 6_000,
+  hooks: 9_000,
+  chapterSummaries: 9_000,
+  subplotBoard: 7_000,
+  emotionalArcs: 7_000,
+  characterMatrix: 12_000,
+  parentCanon: 12_000,
+  volumeOutline: 12_000,
+} as const;
 import {
   readStoryFrame,
   readVolumeMap,
@@ -597,14 +617,22 @@ export class WriterAgent extends BaseAgent {
       chapterNumber: params.chapterNumber,
       title: params.title,
       content: params.content,
-      currentState: params.currentState,
-      ledger: params.ledger,
-      hooks: params.hooks,
-      chapterSummaries: params.chapterSummaries,
-      subplotBoard: params.subplotBoard,
-      emotionalArcs: params.emotionalArcs,
-      characterMatrix: params.characterMatrix,
-      volumeOutline: params.volumeOutline,
+      currentState: this.capLegacyContext("current_state", params.currentState, LEGACY_WRITER_CONTEXT_BUDGET.currentState),
+      ledger: this.capLegacyContext("particle_ledger", params.ledger, LEGACY_WRITER_CONTEXT_BUDGET.ledger),
+      hooks: this.capLegacyContext("pending_hooks", params.hooks, LEGACY_WRITER_CONTEXT_BUDGET.hooks),
+      chapterSummaries: this.capLegacyContext(
+        "chapter_summaries",
+        params.chapterSummaries,
+        LEGACY_WRITER_CONTEXT_BUDGET.chapterSummaries,
+      ),
+      subplotBoard: this.capLegacyContext("subplot_board", params.subplotBoard, LEGACY_WRITER_CONTEXT_BUDGET.subplotBoard),
+      emotionalArcs: this.capLegacyContext("emotional_arcs", params.emotionalArcs, LEGACY_WRITER_CONTEXT_BUDGET.emotionalArcs),
+      characterMatrix: this.capLegacyContext(
+        "character_matrix",
+        params.characterMatrix,
+        LEGACY_WRITER_CONTEXT_BUDGET.characterMatrix,
+      ),
+      volumeOutline: this.capLegacyContext("volume_outline", params.volumeOutline, LEGACY_WRITER_CONTEXT_BUDGET.volumeOutline),
       observations,
       selectedEvidenceBlock: params.selectedEvidenceBlock,
       governedControlBlock,
@@ -731,28 +759,47 @@ export class WriterAgent extends BaseAgent {
     readonly parentCanon?: string;
     readonly language?: "zh" | "en";
   }): string {
+    const currentState = this.capLegacyContext("current_state", params.currentState, LEGACY_WRITER_CONTEXT_BUDGET.currentState);
+    const ledger = this.capLegacyContext("particle_ledger", params.ledger, LEGACY_WRITER_CONTEXT_BUDGET.ledger);
+    const hooks = this.capLegacyContext("pending_hooks", params.hooks, LEGACY_WRITER_CONTEXT_BUDGET.hooks);
+    const chapterSummaries = this.capLegacyContext(
+      "chapter_summaries",
+      params.chapterSummaries,
+      LEGACY_WRITER_CONTEXT_BUDGET.chapterSummaries,
+    );
+    const subplotBoard = this.capLegacyContext("subplot_board", params.subplotBoard, LEGACY_WRITER_CONTEXT_BUDGET.subplotBoard);
+    const emotionalArcs = this.capLegacyContext("emotional_arcs", params.emotionalArcs, LEGACY_WRITER_CONTEXT_BUDGET.emotionalArcs);
+    const characterMatrix = this.capLegacyContext(
+      "character_matrix",
+      params.characterMatrix,
+      LEGACY_WRITER_CONTEXT_BUDGET.characterMatrix,
+    );
+    const storyBible = this.capLegacyContext("story_bible", params.storyBible, LEGACY_WRITER_CONTEXT_BUDGET.storyBible);
+    const parentCanon = params.parentCanon
+      ? this.capLegacyContext("parent_canon", params.parentCanon, LEGACY_WRITER_CONTEXT_BUDGET.parentCanon)
+      : undefined;
     const contextBlock = params.externalContext
       ? `\n## 外部指令\n以下是来自外部系统的创作指令，请在本章中融入：\n\n${params.externalContext}\n`
       : "";
 
-    const ledgerBlock = params.ledger
-      ? `\n## 资源账本\n${params.ledger}\n`
+    const ledgerBlock = ledger
+      ? `\n## 资源账本\n${ledger}\n`
       : "";
 
-    const summariesBlock = params.chapterSummaries !== "(文件尚未创建)"
-      ? `\n## 章节摘要（全部历史章节压缩上下文）\n${params.chapterSummaries}\n`
+    const summariesBlock = chapterSummaries !== "(文件尚未创建)"
+      ? `\n## 章节摘要（全部历史章节压缩上下文）\n${chapterSummaries}\n`
       : "";
 
-    const subplotBlock = params.subplotBoard !== "(文件尚未创建)"
-      ? `\n## 支线进度板\n${params.subplotBoard}\n`
+    const subplotBlock = subplotBoard !== "(文件尚未创建)"
+      ? `\n## 支线进度板\n${subplotBoard}\n`
       : "";
 
-    const emotionalBlock = params.emotionalArcs !== "(文件尚未创建)"
-      ? `\n## 情感弧线\n${params.emotionalArcs}\n`
+    const emotionalBlock = emotionalArcs !== "(文件尚未创建)"
+      ? `\n## 情感弧线\n${emotionalArcs}\n`
       : "";
 
-    const matrixBlock = params.characterMatrix !== "(文件尚未创建)"
-      ? `\n## 角色交互矩阵\n${params.characterMatrix}\n`
+    const matrixBlock = characterMatrix !== "(文件尚未创建)"
+      ? `\n## 角色交互矩阵\n${characterMatrix}\n`
       : "";
 
     const fingerprintBlock = params.dialogueFingerprints
@@ -763,10 +810,10 @@ export class WriterAgent extends BaseAgent {
       ? `\n## 相关历史章节摘要\n${params.relevantSummaries}\n`
       : "";
 
-    const canonBlock = params.parentCanon
+    const canonBlock = parentCanon
       ? `\n## 正传正典参照（番外写作专用）
 本书是番外作品。以下正典约束不可违反，角色不得引用超出其信息边界的信息。
-${params.parentCanon}\n`
+${parentCanon}\n`
       : "";
     const lengthRequirementBlock = this.buildLengthRequirementBlock(params.lengthSpec, params.language ?? "zh");
 
@@ -774,16 +821,16 @@ ${params.parentCanon}\n`
       return `Write chapter ${params.chapterNumber}.
 ${contextBlock}
 ## Current State
-${params.currentState}
+${currentState}
 ${ledgerBlock}
 ## Plot Threads
-${params.hooks}
+${hooks}
 ${summariesBlock}${subplotBlock}${emotionalBlock}${matrixBlock}${fingerprintBlock}${relevantBlock}${canonBlock}
 ## Recent Chapters
 ${params.recentChapters || "(This is the first chapter, no previous text)"}
 
 ## Worldbuilding
-${params.storyBible}
+${storyBible}
 
 ${lengthRequirementBlock}
 - Output PRE_WRITE_CHECK first, then the chapter
@@ -793,20 +840,24 @@ ${lengthRequirementBlock}
     return `请续写第${params.chapterNumber}章。
 ${contextBlock}
 ## 当前状态卡
-${params.currentState}
+${currentState}
 ${ledgerBlock}
 ## 伏笔池
-${params.hooks}
+${hooks}
 ${summariesBlock}${subplotBlock}${emotionalBlock}${matrixBlock}${fingerprintBlock}${relevantBlock}${canonBlock}
 ## 最近章节
 ${params.recentChapters || "(这是第一章，无前文)"}
 
 ## 世界观设定
-${params.storyBible}
+${storyBible}
 
 ${lengthRequirementBlock}
 - 先输出写作自检表，再写正文
       - 只需输出 PRE_WRITE_CHECK、CHAPTER_TITLE、CHAPTER_CONTENT 三个区块`;
+  }
+
+  private capLegacyContext(label: string, content: string, maxChars: number): string {
+    return capContextBlock(content, { label, maxChars });
   }
 
   private buildGovernedUserPrompt(params: {

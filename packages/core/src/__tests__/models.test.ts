@@ -350,6 +350,17 @@ describe("ProjectConfigSchema", () => {
     expect(result.daemon.maxChaptersPerDay).toBe(50);
   });
 
+  it("defaults long-form writing review retries to one and accepts project overrides", () => {
+    const defaults = ProjectConfigSchema.parse(validProject);
+    expect(defaults.writing.reviewRetries).toBe(1);
+
+    const overridden = ProjectConfigSchema.parse({
+      ...validProject,
+      writing: { reviewRetries: 3 },
+    });
+    expect(overridden.writing.reviewRetries).toBe(3);
+  });
+
   it("applies default empty notify array", () => {
     const withoutNotify = {
       name: "p1",

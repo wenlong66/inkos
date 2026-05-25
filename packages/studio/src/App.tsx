@@ -4,7 +4,6 @@ import type { HashRoute } from "./hooks/use-hash-route";
 import { Sidebar } from "./components/Sidebar";
 import { Dashboard } from "./pages/Dashboard";
 import { ChatPage } from "./pages/ChatPage";
-import { BookCreate } from "./pages/BookCreate";
 import { BookDetail } from "./pages/BookDetail";
 import { ChapterReader } from "./pages/ChapterReader";
 import { Analytics } from "./pages/Analytics";
@@ -35,7 +34,7 @@ export function deriveActiveBookId(route: HashRoute): string | undefined {
   return undefined;
 }
 
-export function isStandaloneBookCreateRoute(route: HashRoute): boolean {
+export function isBookCreateChatRoute(route: HashRoute): boolean {
   return route.page === "book-create";
 }
 
@@ -67,6 +66,7 @@ export function App() {
 
   const nav = {
     toDashboard: () => setRoute({ page: "dashboard" }),
+    toChat: () => setRoute({ page: "chat" }),
     toBook: (bookId: string) => setRoute({ page: "book", bookId }),
     toBookSettings: (bookId: string) => setRoute({ page: "book-settings", bookId }),
     toBookCreate: () => setRoute({ page: "book-create" }),
@@ -172,15 +172,33 @@ export function App() {
               <Dashboard nav={nav} sse={sse} theme={theme} t={t} />
             </div>
           )}
-          {isStandaloneBookCreateRoute(route) && (
-            <div className="max-w-4xl mx-auto px-6 py-12 md:px-12 lg:py-16 fade-in">
-              <BookCreate nav={nav} theme={theme} t={t} />
+          {isBookCreateChatRoute(route) && (
+            <div className="absolute inset-0 flex min-w-0">
+              <ChatPage
+                mode="book-create"
+                nav={nav}
+                theme={theme}
+                t={t}
+                sse={sse}
+              />
+            </div>
+          )}
+          {route.page === "chat" && (
+            <div className="absolute inset-0 flex min-w-0">
+              <ChatPage
+                mode="project-chat"
+                nav={nav}
+                theme={theme}
+                t={t}
+                sse={sse}
+              />
             </div>
           )}
           {route.page === "book" && (
             <div className="absolute inset-0 flex min-w-0">
               <ChatPage
                 activeBookId={route.bookId}
+                mode="book"
                 nav={nav}
                 theme={theme}
                 t={t}

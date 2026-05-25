@@ -8,7 +8,6 @@ import { MINIMAX } from "./endpoints/minimax.js";
 import { MOONSHOT } from "./endpoints/moonshot.js";
 import { ZHIPU } from "./endpoints/zhipu.js";
 import { SILICONCLOUD } from "./endpoints/siliconcloud.js";
-import { PPIO } from "./endpoints/ppio.js";
 import { BAILIAN } from "./endpoints/bailian.js";
 import { VOLCENGINE } from "./endpoints/volcengine.js";
 import { HUNYUAN } from "./endpoints/hunyuan.js";
@@ -22,11 +21,6 @@ import { TENCENTCLOUD } from "./endpoints/tencentcloud.js";
 import { XIAOMI_MIMO } from "./endpoints/xiaomimimo.js";
 import { LONGCAT } from "./endpoints/longcat.js";
 import { INTERNLM } from "./endpoints/internlm.js";
-// B3
-import { MODELSCOPE } from "./endpoints/modelscope.js";
-import { GITEEAI } from "./endpoints/giteeai.js";
-import { QINIU } from "./endpoints/qiniu.js";
-import { INFINIAI } from "./endpoints/infiniai.js";
 import { ZEROONE } from "./endpoints/zeroone.js";
 import { AI360 } from "./endpoints/ai360.js";
 // B4
@@ -37,6 +31,7 @@ import { MISTRAL } from "./endpoints/mistral.js";
 import { XAI } from "./endpoints/xai.js";
 import { NEWAPI } from "./endpoints/newapi.js";
 import { GITHUB_COPILOT } from "./endpoints/githubCopilot.js";
+import { KKAIAPI } from "./endpoints/kkaiapi.js";
 // B6 CodingPlan
 import { KIMI_CODING_PLAN } from "./endpoints/kimiCodingPlan.js";
 import { KIMI_CODE } from "./endpoints/kimiCode.js";
@@ -55,10 +50,10 @@ export type { InkosEndpoint, InkosModel, ApiProtocol, EndpointGroup } from "./ty
  */
 const ALL_PROVIDERS: readonly InkosEndpoint[] = [
   ANTHROPIC, OPENAI, GOOGLE, DEEPSEEK, MINIMAX,
-  MOONSHOT, ZHIPU, SILICONCLOUD, PPIO, BAILIAN, VOLCENGINE, HUNYUAN, BAICHUAN, STEPFUN, WENXIN,
+  MOONSHOT, ZHIPU, SILICONCLOUD, BAILIAN, VOLCENGINE, HUNYUAN, BAICHUAN, STEPFUN, WENXIN,
   SPARK, SENSENOVA, TENCENTCLOUD, XIAOMI_MIMO, LONGCAT, INTERNLM,
-  MODELSCOPE, GITEEAI, QINIU, INFINIAI, ZEROONE, AI360,
-  OLLAMA, OPENROUTER, CUSTOM, MISTRAL, XAI, NEWAPI, GITHUB_COPILOT,
+  ZEROONE, AI360,
+  OLLAMA, OPENROUTER, CUSTOM, MISTRAL, XAI, NEWAPI, GITHUB_COPILOT, KKAIAPI,
   // B6 CodingPlan（8 个）
   KIMI_CODING_PLAN, KIMI_CODE, MINIMAX_CODING_PLAN, BAILIAN_CODING_PLAN, GLM_CODING_PLAN, VOLCENGINE_CODING_PLAN, OPENCODE_CODING_PLAN, ASTRON_CODING_PLAN,
 ];

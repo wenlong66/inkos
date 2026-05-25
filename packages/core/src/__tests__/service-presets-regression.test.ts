@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { resolveServicePreset, listModelsForService } from "../llm/service-presets.js";
+import { guessServiceFromBaseUrl, resolveServicePreset, listModelsForService } from "../llm/service-presets.js";
 
 describe("service-presets regression", () => {
   describe("Kimi Code preset", () => {
@@ -19,15 +19,16 @@ describe("service-presets regression", () => {
   });
 
   describe("MiniMax preset", () => {
-    it("has correct domestic MiniMax baseUrl (api.minimaxi.com/anthropic)", () => {
+    it("has correct domestic MiniMax OpenAI-compatible baseUrl", () => {
       const preset = resolveServicePreset("minimax");
       expect(preset).toBeDefined();
-      expect(preset!.baseUrl).toBe("https://api.minimaxi.com/anthropic");
+      expect(preset!.baseUrl).toBe("https://api.minimaxi.com/v1");
     });
 
-    it("uses anthropic-messages api format", () => {
+    it("uses openai-completions api format", () => {
       const preset = resolveServicePreset("minimax");
-      expect(preset!.api).toBe("anthropic-messages");
+      expect(preset!.providerFamily).toBe("openai");
+      expect(preset!.api).toBe("openai-completions");
     });
 
     it("has knownModels with all 7 MiniMax models", () => {
@@ -42,6 +43,22 @@ describe("service-presets regression", () => {
   });
 
   describe("listModelsForService", () => {
+    it("exposes kkaiapi as an OpenAI-compatible aggregator with text models", async () => {
+      const preset = resolveServicePreset("kkaiapi");
+      expect(preset).toMatchObject({
+        providerFamily: "openai",
+        api: "openai-completions",
+        baseUrl: "https://api.kkaiapi.com/v1",
+      });
+      const models = await listModelsForService("kkaiapi");
+      expect(models.map((m) => m.id)).toEqual(expect.arrayContaining([
+        "gpt-5.5",
+        "deepseek-v4-flash",
+        "deepseek-v4-pro",
+      ]));
+      expect(guessServiceFromBaseUrl("https://api.kkaiapi.com/v1")).toBe("kkaiapi");
+    });
+
     it("returns provider bank models for minimax (B8 升级：provider.models 替代 preset.knownModels)", async () => {
       const models = await listModelsForService("minimax");
       expect(models.length).toBeGreaterThanOrEqual(7);

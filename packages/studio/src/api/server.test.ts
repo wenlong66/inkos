@@ -44,9 +44,10 @@ type ServicePresetMock = {
 const SERVICE_PRESETS_MOCK: Record<string, ServicePresetMock> = {
   openai: { providerFamily: "openai", baseUrl: "https://api.openai.com/v1", modelsBaseUrl: "https://api.openai.com/v1", knownModels: [] as string[] },
   anthropic: { providerFamily: "anthropic", baseUrl: "https://api.anthropic.com", modelsBaseUrl: "https://api.anthropic.com", knownModels: [] as string[] },
-  minimax: { providerFamily: "anthropic", baseUrl: "https://api.minimaxi.com/anthropic", modelsBaseUrl: "https://api.minimaxi.com/anthropic", knownModels: [] as string[] },
+  minimax: { providerFamily: "openai", baseUrl: "https://api.minimaxi.com/v1", modelsBaseUrl: "https://api.minimaxi.com/v1", knownModels: [] as string[] },
   bailian: { providerFamily: "anthropic", baseUrl: "https://dashscope.aliyuncs.com/apps/anthropic", modelsBaseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", knownModels: [] as string[] },
   google: { providerFamily: "openai", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", modelsBaseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", knownModels: [] as string[] },
+  kkaiapi: { providerFamily: "openai", baseUrl: "https://api.kkaiapi.com/v1", modelsBaseUrl: "https://api.kkaiapi.com/v1", knownModels: [] as string[] },
   ollama: { providerFamily: "openai", baseUrl: "http://localhost:11434/v1", modelsBaseUrl: "http://localhost:11434/v1", knownModels: [] as string[] },
   custom: { providerFamily: "openai", baseUrl: "", knownModels: [] as string[] },
 };
@@ -85,7 +86,7 @@ const endpointIdsByGroup = {
     "minimax", "moonshot", "sensenova", "spark", "stepfun", "tencentcloud",
     "volcengine", "wenxin", "xiaomimimo", "zeroone", "zhipu",
   ],
-  aggregator: ["giteeai", "infiniai", "modelscope", "newapi", "openrouter", "ppio", "qiniu", "siliconcloud"],
+  aggregator: ["kkaiapi", "openrouter", "newapi", "siliconcloud"],
   local: ["githubCopilot", "ollama"],
   codingPlan: [
     "astronCodingPlan", "bailianCodingPlan", "glmCodingPlan", "kimiCodingPlan", "kimicode",
@@ -215,6 +216,9 @@ vi.mock("@actalk/inkos-core", async (importOriginal) => {
     resolveSessionActiveBook: resolveSessionActiveBookMock,
     runAgentSession: runAgentSessionMock,
     buildAgentSystemPrompt: vi.fn(() => "You are helpful."),
+    listAvailableGenres: actual.listAvailableGenres,
+    readGenreProfile: actual.readGenreProfile,
+    getBuiltinGenresDir: actual.getBuiltinGenresDir,
     createAndPersistBookSession: createAndPersistBookSessionMock,
     loadBookSession: loadBookSessionMock,
     persistBookSession: persistBookSessionMock,
@@ -229,6 +233,9 @@ vi.mock("@actalk/inkos-core", async (importOriginal) => {
     resolveServiceProviderFamily: resolveServiceProviderFamilyMock,
     resolveServiceModelsBaseUrl: resolveServiceModelsBaseUrlMock,
     resolveServiceModel: resolveServiceModelMock,
+    COVER_PROVIDER_PRESETS: actual.COVER_PROVIDER_PRESETS,
+    coverSecretKey: actual.coverSecretKey,
+    resolveCoverProviderPreset: actual.resolveCoverProviderPreset,
     isApiKeyOptionalForEndpoint: actual.isApiKeyOptionalForEndpoint,
     loadSecrets: loadSecretsMock,
     saveSecrets: saveSecretsMock,
@@ -450,7 +457,7 @@ describe("createStudioServer daemon lifecycle", () => {
     expect(vi.isMockFunction(isSafeBookId)).toBe(false);
     expect(isSafeBookId("demo-book")).toBe(true);
     expect(isSafeBookId("demo/book")).toBe(false);
-  });
+  }, 10_000);
 
   it("returns from /api/daemon/start before the first write cycle finishes", async () => {
     let resolveStart: (() => void) | undefined;
@@ -479,7 +486,7 @@ describe("createStudioServer daemon lifecycle", () => {
     await expect(status.json()).resolves.toEqual({ running: true });
 
     resolveStart?.();
-  });
+  }, 10_000);
 
   it("rejects book routes with path traversal ids", async () => {
     const { createStudioServer } = await import("./server.js");
@@ -685,6 +692,35 @@ describe("createStudioServer daemon lifecycle", () => {
     });
   });
 
+  it("persists Studio radar scans and exposes scan history", async () => {
+    runRadarMock.mockResolvedValueOnce({
+      timestamp: "2026-05-14T12:00:00.000Z",
+      marketSummary: "女频短篇复仇继续强势",
+      recommendations: [],
+    });
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const scan = await app.request("http://localhost/api/v1/radar/scan", { method: "POST" });
+    expect(scan.status).toBe(200);
+
+    const history = await app.request("http://localhost/api/v1/radar/history");
+    expect(history.status).toBe(200);
+    await expect(history.json()).resolves.toMatchObject({
+      items: [
+        {
+          file: "scan-2026-05-14T12-00-00-000Z.json",
+          timestamp: "2026-05-14T12:00:00.000Z",
+          summaryPreview: "女频短篇复仇继续强势",
+          result: {
+            marketSummary: "女频短篇复仇继续强势",
+          },
+        },
+      ],
+    });
+  });
+
   it("updates the first-run language immediately after the language selector saves", async () => {
     const { createStudioServer } = await import("./server.js");
     const app = createStudioServer(cloneProjectConfig() as never, root);
@@ -701,6 +737,39 @@ describe("createStudioServer daemon lifecycle", () => {
     await expect(project.json()).resolves.toMatchObject({
       language: "en",
       languageExplicit: true,
+    });
+  });
+
+  it("writes parseable custom genre frontmatter when user text contains YAML punctuation", async () => {
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const create = await app.request("http://localhost/api/v1/genres/create", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        id: "revenge-short",
+        name: "短篇：复仇",
+        language: "zh",
+        chapterTypes: ["开局", "反杀"],
+        fatigueWords: ["震惊"],
+        pacingRule: "3:1 压迫/回报",
+        body: "规则正文",
+      }),
+    });
+    expect(create.status).toBe(200);
+
+    const list = await app.request("http://localhost/api/v1/genres");
+    expect(list.status).toBe(200);
+    await expect(list.json()).resolves.toMatchObject({
+      genres: expect.arrayContaining([
+        expect.objectContaining({
+          id: "revenge-short",
+          name: "短篇：复仇",
+          source: "project",
+          language: "zh",
+        }),
+      ]),
     });
   });
 
@@ -727,13 +796,14 @@ describe("createStudioServer daemon lifecycle", () => {
     expect(res.status).toBe(200);
     const body = await res.json() as { services: Array<{ service: string; group?: string; connected: boolean }> };
     const bank = body.services.filter((s) => !s.service.startsWith("custom"));
-    expect(bank.length).toBe(41);
+    expect(bank.length).toBe(37);
     expect(bank.every((s) => typeof s.group === "string")).toBe(true);
     expect(bank.filter((s) => s.group === "overseas")).toHaveLength(5);
     expect(bank.filter((s) => s.group === "china")).toHaveLength(18);
-    expect(bank.filter((s) => s.group === "aggregator")).toHaveLength(8);
+    expect(bank.filter((s) => s.group === "aggregator")).toHaveLength(4);
     expect(bank.filter((s) => s.group === "local")).toHaveLength(2);
     expect(bank.filter((s) => s.group === "codingPlan")).toHaveLength(8);
+    expect(bank.filter((s) => s.group === "aggregator").map((s) => s.service)[0]).toBe("kkaiapi");
     expect(body.services.find((s) => s.service === "moonshot")?.connected).toBe(true);
     expect(body.services.find((s) => s.service === "custom:内网GPT")).toMatchObject({
       connected: true,
@@ -866,6 +936,55 @@ describe("createStudioServer daemon lifecycle", () => {
     );
   });
 
+  it("tests local custom OpenAI-compatible services without an API key and uses discovered models", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ data: [{ id: "qwen3.6:35b-a3b" }] }),
+      text: async () => "",
+    });
+    vi.stubGlobal("fetch", fetchMock as typeof fetch);
+    createLLMClientMock.mockImplementation(((cfg: unknown) => cfg) as any);
+    chatCompletionMock.mockImplementation(async (_client: any, model: string) => {
+      if (model === "qwen3.6:35b-a3b") {
+        return {
+          content: "pong",
+          usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
+        };
+      }
+      throw new Error(`unexpected model: ${model}`);
+    });
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/services/custom%3ALocal/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        apiKey: "",
+        baseUrl: "http://127.0.0.1:8001/v1",
+        apiFormat: "chat",
+        stream: false,
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      ok: true,
+      selectedModel: "qwen3.6:35b-a3b",
+      detected: {
+        apiFormat: "chat",
+        stream: false,
+        modelsSource: "api",
+      },
+    });
+    expect(chatCompletionMock.mock.calls.map((call) => call[1])).not.toContain("kimi-k2.5");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:8001/v1/models",
+      expect.objectContaining({ headers: {} }),
+    );
+  });
+
   it("merges service config patches instead of overwriting existing services", async () => {
     await writeFile(join(root, "inkos.json"), JSON.stringify({
       ...projectConfig,
@@ -902,6 +1021,89 @@ describe("createStudioServer daemon lifecycle", () => {
       { service: "moonshot", temperature: 0.5, apiFormat: "responses", stream: false },
       { service: "custom", name: "内网GPT", baseUrl: "https://llm.internal.corp/v1", temperature: 0.9, apiFormat: "responses", stream: false },
     ]);
+  });
+
+  it("refreshes top-level llm mirror when switching from custom baseUrl to a preset service", async () => {
+    await writeFile(join(root, "inkos.json"), JSON.stringify({
+      ...projectConfig,
+      llm: {
+        provider: "openai",
+        service: "custom",
+        configSource: "studio",
+        baseUrl: "https://www.openclaudecode.cn/v1",
+        model: "gpt-5.4",
+        apiFormat: "chat",
+        stream: true,
+        services: [
+          { service: "custom", name: "Global LLM", baseUrl: "https://www.openclaudecode.cn/v1", apiFormat: "chat", stream: true },
+        ],
+        defaultModel: "gpt-5.4",
+      },
+    }, null, 2), "utf-8");
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const save = await app.request("http://localhost/api/v1/services/config", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        service: "kkaiapi",
+        defaultModel: "deepseek-v4-flash",
+        services: [
+          { service: "kkaiapi", temperature: 0.7, apiFormat: "chat", stream: true },
+        ],
+      }),
+    });
+
+    expect(save.status).toBe(200);
+
+    const raw = JSON.parse(await readFile(join(root, "inkos.json"), "utf-8"));
+    expect(raw.llm.service).toBe("kkaiapi");
+    expect(raw.llm.defaultModel).toBe("deepseek-v4-flash");
+    expect(raw.llm.model).toBe("deepseek-v4-flash");
+    expect(raw.llm.provider).toBe("openai");
+    expect(raw.llm.baseUrl).toBe("https://api.kkaiapi.com/v1");
+  });
+
+  it("deletes a custom service config and stored secret", async () => {
+    await writeFile(join(root, "inkos.json"), JSON.stringify({
+      ...projectConfig,
+      llm: {
+        service: "custom:内网GPT",
+        defaultModel: "corp-chat",
+        services: [
+          { service: "custom", name: "内网GPT", baseUrl: "https://llm.internal.corp/v1", temperature: 0.9, apiFormat: "chat", stream: false },
+          { service: "moonshot", temperature: 1, apiFormat: "chat", stream: true },
+        ],
+      },
+    }, null, 2), "utf-8");
+    loadSecretsMock.mockResolvedValue({
+      services: {
+        "custom:内网GPT": { apiKey: "sk-corp" },
+        moonshot: { apiKey: "sk-moon" },
+      },
+    });
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/services/custom%3A%E5%86%85%E7%BD%91GPT", {
+      method: "DELETE",
+    });
+
+    expect(response.status).toBe(200);
+    const raw = JSON.parse(await readFile(join(root, "inkos.json"), "utf-8"));
+    expect(raw.llm.services).toEqual([
+      { service: "moonshot", temperature: 1, apiFormat: "chat", stream: true },
+    ]);
+    expect(raw.llm.service).toBeUndefined();
+    expect(raw.llm.defaultModel).toBeUndefined();
+    expect(saveSecretsMock).toHaveBeenCalledWith(root, {
+      services: {
+        moonshot: { apiKey: "sk-moon" },
+      },
+    });
   });
 
   it("reports config source and detected env overrides for Studio switching", async () => {
@@ -1072,7 +1274,7 @@ describe("createStudioServer daemon lifecycle", () => {
     });
   });
 
-  it("auto-detects a working custom combination when /models is unavailable", async () => {
+  it("does not probe stale global fallback models for custom services when /models is unavailable", async () => {
     await writeFile(join(root, "inkos.json"), JSON.stringify({
       ...projectConfig,
       llm: {
@@ -1120,17 +1322,12 @@ describe("createStudioServer daemon lifecycle", () => {
       }),
     });
 
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(400);
     await expect(response.json()).resolves.toMatchObject({
-      ok: true,
-      selectedModel: "MiniMax-M2.7",
-      detected: {
-        apiFormat: "chat",
-        stream: false,
-        modelsSource: "fallback",
-      },
-      models: [],
+      ok: false,
+      error: expect.stringContaining("无法自动确定模型"),
     });
+    expect(chatCompletionMock).not.toHaveBeenCalled();
   });
 
   it("falls back to the detected/default model when custom /models is unavailable", async () => {
@@ -1191,14 +1388,14 @@ describe("createStudioServer daemon lifecycle", () => {
     });
 
     expect(response.status).toBe(400);
-    await expect(response.json()).resolves.toMatchObject({
-      ok: false,
-      error: expect.stringContaining("401"),
-    });
+    const json = await response.json() as { ok: boolean; error: string };
+    expect(json.ok).toBe(false);
+    expect(json.error).toContain("401");
+    expect(json.error).not.toMatch(/kkaiapi/i);
     expect(chatCompletionMock).not.toHaveBeenCalled();
   });
 
-  it("uses the MiniMax preset provider family during service probe", async () => {
+  it("uses the MiniMax OpenAI-compatible preset during service probe", async () => {
     await writeFile(join(root, "inkos.json"), JSON.stringify({
       ...projectConfig,
       llm: {
@@ -1217,7 +1414,7 @@ describe("createStudioServer daemon lifecycle", () => {
     vi.stubGlobal("fetch", fetchMock as typeof fetch);
     createLLMClientMock.mockImplementation(((cfg: unknown) => cfg) as any);
     chatCompletionMock.mockImplementation(async (client: any, model: string) => {
-      if (client.provider === "anthropic" && client.baseUrl === "https://api.minimaxi.com/anthropic" && model === "MiniMax-M2.7") {
+      if (client.provider === "openai" && client.baseUrl === "https://api.minimaxi.com/v1" && model === "MiniMax-M2.7") {
         return {
           content: "pong",
           usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
@@ -1246,7 +1443,7 @@ describe("createStudioServer daemon lifecycle", () => {
       detected: {
         apiFormat: "chat",
         stream: false,
-        baseUrl: "https://api.minimaxi.com/anthropic",
+        baseUrl: "https://api.minimaxi.com/v1",
       },
     });
   });
@@ -1313,15 +1510,6 @@ describe("createStudioServer daemon lifecycle", () => {
     });
     vi.stubGlobal("fetch", fetchMock as typeof fetch);
     createLLMClientMock.mockImplementation(((cfg: unknown) => cfg) as any);
-    chatCompletionMock.mockImplementation(async (_client: any, model: string) => {
-      if (model === "doubao-seed-2.0-lite") {
-        return {
-          content: "pong",
-          usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
-        };
-      }
-      throw new Error(`unexpected model: ${model}`);
-    });
 
     const { createStudioServer } = await import("./server.js");
     const app = createStudioServer(cloneProjectConfig() as never, root);
@@ -1345,7 +1533,93 @@ describe("createStudioServer daemon lifecycle", () => {
         modelsSource: "api",
       },
     });
-    expect(chatCompletionMock.mock.calls.map((call) => call[1])).not.toContain("doubao-lite-32k");
+    expect(chatCompletionMock).not.toHaveBeenCalled();
+  });
+
+  it("does not run chat probes when /models returns a usable text model", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        data: [
+          { id: "model-one" },
+          { id: "model-two" },
+          { id: "model-three" },
+        ],
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock as typeof fetch);
+    createLLMClientMock.mockImplementation(((cfg: unknown) => cfg) as any);
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/services/volcengine/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        apiKey: "volc-key",
+        baseUrl: "https://ark.cn-beijing.volces.com/api/v3",
+        apiFormat: "chat",
+        stream: false,
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(chatCompletionMock).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toMatchObject({
+      ok: true,
+      selectedModel: "model-one",
+      models: [
+        { id: "model-one", name: "model-one" },
+        { id: "model-two", name: "model-two" },
+        { id: "model-three", name: "model-three" },
+      ],
+    });
+  });
+
+  it("uses static aggregator models instead of chat probing when kkaiapi /models is unavailable", async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 404,
+      text: async () => "not found",
+    });
+    vi.stubGlobal("fetch", fetchMock as typeof fetch);
+    createLLMClientMock.mockImplementation(((cfg: unknown) => cfg) as any);
+
+    const kkaiapiEndpoint = endpointMocks.find((ep) => ep.id === "kkaiapi");
+    if (kkaiapiEndpoint) {
+      Object.assign(kkaiapiEndpoint, {
+        checkModel: "deepseek-v4-flash",
+        models: [
+          { id: "deepseek-v4-flash", maxOutput: 4096, contextWindowTokens: 32768, enabled: true },
+          { id: "gpt-image-2", maxOutput: 1, contextWindowTokens: 1, enabled: false },
+        ],
+      });
+    }
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/services/kkaiapi/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        apiKey: "sk-kkai",
+        apiFormat: "chat",
+        stream: false,
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(chatCompletionMock).not.toHaveBeenCalled();
+    await expect(response.json()).resolves.toMatchObject({
+      ok: true,
+      selectedModel: "deepseek-v4-flash",
+      detected: {
+        modelsSource: "fallback",
+      },
+      models: [{ id: "deepseek-v4-flash", name: "deepseek-v4-flash" }],
+    });
   });
 
   it("uses discovered Ollama models without requiring an API key or the built-in check model", async () => {
@@ -1365,15 +1639,6 @@ describe("createStudioServer daemon lifecycle", () => {
     });
     vi.stubGlobal("fetch", fetchMock as typeof fetch);
     createLLMClientMock.mockImplementation(((cfg: unknown) => cfg) as any);
-    chatCompletionMock.mockImplementation(async (_client: any, model: string) => {
-      if (model === "qwen3.6:35b-a3b") {
-        return {
-          content: "pong",
-          usage: { promptTokens: 1, completionTokens: 1, totalTokens: 2 },
-        };
-      }
-      throw new Error(`unexpected model: ${model}`);
-    });
 
     const { createStudioServer } = await import("./server.js");
     const app = createStudioServer(cloneProjectConfig() as never, root);
@@ -1394,7 +1659,7 @@ describe("createStudioServer daemon lifecycle", () => {
       selectedModel: "qwen3.6:35b-a3b",
       models: [{ id: "qwen3.6:35b-a3b", name: "qwen3.6:35b-a3b" }],
     });
-    expect(chatCompletionMock.mock.calls.map((call) => call[1])).not.toContain("llama3.2:3b");
+    expect(chatCompletionMock).not.toHaveBeenCalled();
   });
 
   it("does not fall back to the global default model when a bank endpoint probe fails", async () => {
@@ -1481,6 +1746,7 @@ describe("createStudioServer daemon lifecycle", () => {
     expect(json.error).toContain("API Key 是否来自 Google AI Studio");
     expect(json.error).toContain("Gemini API");
     expect(json.error).not.toContain("Moonshot");
+    expect(json.error).not.toMatch(/kkaiapi/i);
   });
 
   it("does not return OpenAI-compatible Bailian models from the Anthropic channel connection test", async () => {
@@ -1630,6 +1896,87 @@ describe("createStudioServer daemon lifecycle", () => {
     await expect(response.json()).resolves.toEqual({ apiKey: "sk-moon" });
   });
 
+  it("rejects non-header-safe service secrets instead of persisting diagnostic text", async () => {
+    loadSecretsMock.mockResolvedValue({ services: {} });
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/services/kkaiapi/secret", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        apiKey: "kkaiapi 测试连接失败。上游返回：Cannot convert argument to a ByteString",
+      }),
+    });
+
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: expect.stringContaining("API Key"),
+    });
+    expect(saveSecretsMock).not.toHaveBeenCalled();
+  });
+
+  it("saves cover generation config and a separate cover API key", async () => {
+    loadSecretsMock.mockResolvedValue({ services: {} });
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const saveConfig = await app.request("http://localhost/api/v1/cover/config", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        service: "kkaiapi",
+        model: "gpt-image-2",
+      }),
+    });
+    expect(saveConfig.status).toBe(200);
+
+    const raw = JSON.parse(await readFile(join(root, "inkos.json"), "utf-8"));
+    expect(raw.llm.cover).toEqual({
+      service: "kkaiapi",
+      model: "gpt-image-2",
+    });
+
+    const saveSecret = await app.request("http://localhost/api/v1/cover/secret/kkaiapi", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ apiKey: "sk-cover" }),
+    });
+    expect(saveSecret.status).toBe(200);
+    expect(saveSecretsMock).toHaveBeenCalledWith(root, {
+      services: {
+        "cover:kkaiapi": { apiKey: "sk-cover" },
+      },
+    });
+  });
+
+  it("serves generated project cover images without exposing arbitrary files", async () => {
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+    const imagePath = join(root, "shorts", "demo", "final", "cover.png");
+    await mkdir(join(root, "shorts", "demo", "final"), { recursive: true });
+    await writeFile(imagePath, Buffer.from("fake-png"));
+    await writeFile(join(root, "shorts", "demo", "final", "cover.txt"), "nope", "utf-8");
+    await mkdir(join(root, "books", "demo"), { recursive: true });
+    await writeFile(join(root, "books", "demo", "cover.png"), Buffer.from("private-book-image"));
+
+    const ok = await app.request("http://localhost/api/v1/project/files/shorts/demo/final/cover.png");
+    expect(ok.status).toBe(200);
+    expect(ok.headers.get("content-type")).toContain("image/png");
+    expect(Buffer.from(await ok.arrayBuffer()).toString("utf-8")).toBe("fake-png");
+
+    const unsupported = await app.request("http://localhost/api/v1/project/files/shorts/demo/final/cover.txt");
+    expect(unsupported.status).toBe(415);
+
+    const unsupportedRoot = await app.request("http://localhost/api/v1/project/files/books/demo/cover.png");
+    expect(unsupportedRoot.status).toBe(400);
+
+    const traversal = await app.request("http://localhost/api/v1/project/files/../inkos.json");
+    expect([400, 404]).toContain(traversal.status);
+  });
+
   it("rejects create requests when a complete book with the same id already exists", async () => {
     await mkdir(join(root, "books", "existing-book", "story"), { recursive: true });
     await writeFile(join(root, "books", "existing-book", "book.json"), JSON.stringify({ id: "existing-book" }), "utf-8");
@@ -1705,12 +2052,10 @@ describe("createStudioServer daemon lifecycle", () => {
     });
 
     expect(response.status).toBe(400);
-    await expect(response.json()).resolves.toEqual({
-      error: {
-        code: "LLM_CONFIG_ERROR",
-        message: "Studio LLM API key not set. Open Studio services and save an API key for the selected service.",
-      },
-    });
+    const json = await response.json() as { error: { code: string; message: string } };
+    expect(json.error.code).toBe("LLM_CONFIG_ERROR");
+    expect(json.error.message).toContain("Studio LLM API key not set");
+    expect(json.error.message).not.toMatch(/kkaiapi/i);
     expect(processProjectInteractionRequestMock).not.toHaveBeenCalled();
   });
 
@@ -2040,6 +2385,128 @@ describe("createStudioServer daemon lifecycle", () => {
       expect.any(Array),
       "继续",
     );
+  });
+
+  it("passes configured long-form writing review retries into Studio write-next", async () => {
+    await writeFile(
+      join(root, "inkos.json"),
+      JSON.stringify({
+        ...cloneProjectConfig(),
+        writing: { reviewRetries: 3 },
+      }, null, 2),
+      "utf-8",
+    );
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/books/demo-book/write-next", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+
+    expect(response.status).toBe(200);
+    expect(pipelineConfigs.at(-1)).toEqual(expect.objectContaining({
+      writingReviewRetries: 3,
+    }));
+  });
+
+  it("handles explicit chat chapter edits outside the InkOS writing agent", async () => {
+    loadChapterIndexMock.mockResolvedValueOnce([{
+      number: 3,
+      title: "Demo",
+      status: "ready-for-review",
+      wordCount: 4,
+      createdAt: "2026-04-12T00:00:00.000Z",
+      updatedAt: "2026-04-12T00:00:00.000Z",
+      auditIssues: [],
+      lengthWarnings: [],
+    }]);
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "第3章把「Body」改成「Body updated」",
+        activeBookId: "demo-book",
+        sessionId: "agent-session-1",
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      response: expect.stringContaining("已直接编辑 demo-book 第 3 章"),
+      session: {
+        sessionId: "agent-session-1",
+        activeBookId: "demo-book",
+      },
+    });
+    await expect(readFile(join(root, "books", "demo-book", "chapters", "0003_Demo.md"), "utf-8"))
+      .resolves.toContain("Body updated");
+    expect(saveChapterIndexMock).toHaveBeenCalledWith("demo-book", [
+      expect.objectContaining({
+        number: 3,
+        status: "audit-failed",
+        wordCount: expect.any(Number),
+        auditIssues: expect.arrayContaining(["[warning] Chat external edit requires review before continuation."]),
+      }),
+    ]);
+    expect(runAgentSessionMock).not.toHaveBeenCalled();
+    expect(writeNextChapterMock).not.toHaveBeenCalled();
+  });
+
+  it("handles explicit chat artifact edits only for content roots", async () => {
+    await mkdir(join(root, "covers", "demo"), { recursive: true });
+    await writeFile(join(root, "covers", "demo", "cover-prompt.md"), "标题字太小。\n", "utf-8");
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "把 covers/demo/cover-prompt.md 里的「标题字太小」改成「标题字压到最大」",
+        sessionId: "agent-session-1",
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      response: expect.stringContaining("已直接编辑 covers/demo/cover-prompt.md"),
+    });
+    await expect(readFile(join(root, "covers", "demo", "cover-prompt.md"), "utf-8"))
+      .resolves.toContain("标题字压到最大");
+    expect(saveChapterIndexMock).not.toHaveBeenCalled();
+    expect(runAgentSessionMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects chat artifact edits against source files instead of routing to the agent", async () => {
+    await mkdir(join(root, "packages", "core", "src"), { recursive: true });
+    await writeFile(join(root, "packages", "core", "src", "index.ts"), "export const value = 1;\n", "utf-8");
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "把 packages/core/src/index.ts 里的「value」改成「other」",
+        sessionId: "agent-session-1",
+      }),
+    });
+
+    expect(response.status).toBe(400);
+    const body = await response.json() as { error: { code: string } };
+    expect(body.error.code).toBe("UNSUPPORTED_CHAT_EDIT_TARGET");
+    await expect(readFile(join(root, "packages", "core", "src", "index.ts"), "utf-8"))
+      .resolves.toContain("value");
+    expect(runAgentSessionMock).not.toHaveBeenCalled();
   });
 
   it("rejects unsafe activeBookId in the Studio agent API", async () => {

@@ -1,5 +1,74 @@
 # Changelog
 
+## v1.4.1
+
+### Release Focus
+
+Windows / provider 热修与长篇写作提速配置化：修复 MiniMax 默认端点不通的问题，保留长篇默认一轮自动修稿的速度收益，同时允许项目把自动修稿轮数配置回 3。
+
+### Improvements
+
+- 长篇章节写作的自动审稿修稿轮数新增 `writing.reviewRetries` 项目配置，默认仍为 1；需要更强修稿时可执行 `inkos config set writing.reviewRetries 3`
+- Studio 写章链路会读取同一项目配置，CLI 和 Studio 行为保持一致
+- README / 开发说明同步 v1.4.1 的 MiniMax 与长篇写作配置变化
+
+### Bug Fixes
+
+- 修复 MiniMax 默认 provider 仍指向已不可用的 Anthropic 端点，导致 Windows 原生环境测试连接失败的问题
+- 修复 MiniMax endpoint 元数据覆盖逻辑过宽，可能影响其他服务商路由判断的问题
+
+## v1.4.0
+
+### Release Focus
+
+短篇写作与 Studio Chat 协作大版本：新增公开短篇生产链路、封面制作工具、普通聊天持久化会话和生成物预览，并修复长篇长度归一化可能被输出上限截断的问题。
+
+### Improvements
+
+- 新增独立短篇写作链路：Studio Chat 和 CLI 可生成完整短篇正文、大纲记录、审稿记录、简介卖点和封面提示词
+- 新增封面制作能力：支持单独生成 / 重做封面，并在 Studio 消息中直接预览生成后的封面图
+- Studio 普通聊天支持项目级持久化 session，刷新或重启后可继续查看、切换、改名和删除会话
+- Chat 可直接编辑项目内生成文本产物，适合调整章节、封面提示词、简介等文件后再继续使用 InkOS 写作链路
+- 服务配置页新增封面生成配置区，封面文本模型和图片模型分工更清晰
+
+### Bug Fixes
+
+- 修复短篇 / 封面工具执行结果中的图片路径只显示文本、不渲染预览的问题
+- 修复 Studio 工具调用详情在消息恢复后丢失的问题
+- 修复 `LengthNormalizerAgent` 显式设置 `maxTokens` 可能导致长章节压缩 / 扩写输出被截断的问题
+
+## v1.3.12
+
+### Release Focus
+
+Studio 服务配置体验小版本：把聚合服务入口放到更顺手的位置，补充官网 / 文档 / 模型页快捷访问，并把服务分组文案统一为“聚合 API”。
+
+### Improvements
+
+- Studio 服务列表和服务详情页为重点聚合服务补充外部快捷入口，配置前可直接打开官网、文档和模型列表
+- 聚合服务分组标题统一为“聚合 API”，避免误导性表达
+
+## v1.3.11
+
+### Release Focus
+
+Studio 服务与聚合模型接入更新：新增 kkaiapi 服务选项，修复自定义/本地 OpenAI-compatible 服务测试误用兜底模型、API Key 中文字符导致连接崩溃、服务配置删除缺失等问题，并补齐雷达历史、题材管理刷新和长篇多线比例落地。
+
+### Improvements
+
+- 新增 kkaiapi 聚合模型服务选项，Studio / CLI 服务配置可以直接选择并测试
+- Studio 新建书籍改走共享对话交互内核，避免建书入口和真实创作链路行为分叉
+- 雷达扫描结果持久化为历史记录，Studio 可浏览既有 scan 结果
+- 长篇大纲 / 章纲会更明确承接用户设定的多线比例，减少“比例写了但结构里没体现”的情况
+
+### Bug Fixes
+
+- 修复自定义服务连接测试误用全局兜底模型或错误协议，导致 llama.cpp / 本地 OpenAI-compatible 服务被误判不可用的问题
+- 修复 API Key 或请求头含中文等非 ASCII 字符时触发 ByteString 转换异常的问题
+- 修复 Studio 缺少删除自定义服务 / 模型配置入口的问题
+- 修复题材管理保存后文件已生成但 Studio 列表不刷新的问题
+- 修复 `hooks.json` 里 hook id 可能出现重复横线或异常标点的问题
+
 ## v1.3.10
 
 ### Release Focus

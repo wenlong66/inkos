@@ -21,11 +21,21 @@
 
 AI Agent 自主写小说——写、审、改，全程接管。覆盖玄幻、仙侠、都市、科幻等多种风格，支持续写、番外、同人、仿写等创作形式。人工审核门控确保你始终掌控全局。已发布为 [OpenClaw](https://clawhub.ai/narcooo/inkos) skill。
 
+
+
+**v1.4.0 短篇写作与 Studio Chat 协作更新** — Studio Chat 和 CLI 现在可以生成独立短篇、简介卖点和封面提示词 / 封面图；普通聊天支持持久化 session，生成物可直接预览和编辑；Studio 模型配置内置 [kkaiapi](https://kkaiapi.com/) ，方便接入全球主流模型聚合服务。
+
 **InkOS Studio 2.0 正式发布！** — 直接运行 `inkos` 启动本地 Web 工作台。书籍管理、章节审阅编辑、实时写作进度、市场雷达、数据分析、AI 检测、文风分析、题材管理、守护进程控制、真相文件编辑——CLI 能做的，Studio 全部可视化。
 
 **InkOS TUI 正式发布！** — 运行 `inkos tui` 进入全屏交互仪表盘。对话式创作、自然语言操作书籍、slash 命令补全、主题动效——TUI、Studio、OpenClaw 共享同一套交互内核。
 
-**v1.3.10 建书 platform 热修** — 修复网页和命令行建书时 `sub_agent.platform` 别名输入触发 schema 校验失败的问题；Studio、CLI、TUI、agent 建书链路都会把平台参数归一化为合法值。
+**InkOS Short** — Studio 对话和 CLI 现在可以直接产出独立短篇：完整正文、大纲记录、审稿记录、简介卖点、封面提示词，并在配置封面服务后生成封面图。
+
+> 短篇开篇示例：宋词三个多月没坐过这辆车了。蓝牙自动连上她的手机，屏幕弹出“子账号登录中”。她点进常用地址统计：新城花园 187 次，妇幼医院 38 次，月子中心 9 次。后备箱传来闷响，徐晋安放完东西坐进来，冲她笑笑：“今晚加班，你自己打车回去？”她抬头看他，也笑了。
+
+<p align="center">
+  <img src="assets/inkos-short-demo-cover.png" width="320" alt="InkOS Short 短篇封面示例">
+</p>
 
 **Native English novel writing now supported！** Set `--lang en` to write in English. See [English README](README.en.md) for details.
 
@@ -35,7 +45,7 @@ AI Agent 自主写小说——写、审、改，全程接管。覆盖玄幻、�
 > 欢迎加群反馈问题、提出需求，也欢迎关注项目动态 — 我们的目标是做最强的基于小说的内容生态创作 AI Agent。
 
 <p align="center">
-  <img src="assets/14qun.jpg" width="300" alt="微信交流群">
+  <img src="assets/4e50013fc562bdccb579eda0b77fd1a2.jpg" width="300" alt="微信交流群">
 </p>
 
 ## 快速开始
@@ -184,7 +194,7 @@ inkos doctor
 | `cli-project` | CLI 运行时：以 Studio 配置为基础，再叠加 env 和 CLI 参数 |
 | `legacy-env` | 旧 env 模式：兼容老项目的纯 `.env` 配置 |
 
-如果服务测试失败，优先检查服务商、模型和协议是否匹配。Google Gemini 的 AI Studio API Key 可用于 Gemini OpenAI-compatible endpoint；InkOS 会自动禁用 Google 不支持的 OpenAI `store` 参数。MiniMax / MiniMax CodingPlan 会优先使用可工作的非流式 transport，避免流式返回 usage 但无正文的问题。
+如果服务测试失败，优先检查服务商、模型和协议是否匹配。Google Gemini 的 AI Studio API Key 可用于 Gemini OpenAI-compatible endpoint；InkOS 会自动禁用 Google 不支持的 OpenAI `store` 参数。MiniMax / MiniMax CodingPlan 默认走官方 OpenAI-compatible `/v1/chat/completions`，并优先使用可工作的非流式 transport，避免流式返回 usage 但无正文的问题。
 
 ### v2.0 LLM 配置更新
 
@@ -192,7 +202,7 @@ inkos doctor
 - **Provider bank 能力表**：内置 Google Gemini、Moonshot、MiniMax、智谱、百炼、DeepSeek、硅基流动、PPIO、OpenRouter、Ollama、CodingPlan 等服务的 baseUrl、协议、模型和兼容策略。
 - **模型归属校验**：`--service google --model kimi-k2.5` 这类错配会直接报错，避免把请求发到错误服务商。
 - **Google Gemini 兼容修复**：AI Studio API Key 可直接用于 Gemini OpenAI-compatible endpoint，InkOS 会自动禁用 Google 不支持的 OpenAI `store` 参数。
-- **MiniMax transport 探测**：MiniMax / MiniMax CodingPlan 自动使用可工作的 transport，规避流式 usage 正常但正文为空的问题。
+- **MiniMax transport 探测**：MiniMax / MiniMax CodingPlan 使用官方 OpenAI-compatible `/v1` 入口，并自动使用可工作的非流式 transport，规避流式 usage 正常但正文为空的问题。
 - **旧 env 兼容**：老的 `INKOS_LLM_BASE_URL + INKOS_LLM_MODEL + INKOS_LLM_API_KEY` 仍可用于 CLI；没有 `INKOS_LLM_SERVICE` 时会尝试从 baseUrl 反推服务商。
 
 ### v1.2 更新
@@ -212,13 +222,44 @@ inkos doctor
 
 ```bash
 inkos book create --title "吞天魔帝" --genre xuanhuan  # 创建新书
-inkos write next 吞天魔帝      # 写下一章（完整管线：草稿 → 审计 → 修订）
+inkos write next 吞天魔帝      # 写下一章（草稿 → 审计 → 按配置修订）
 inkos status                   # 查看状态
 inkos review list 吞天魔帝     # 审阅草稿
 inkos review approve-all 吞天魔帝  # 批量通过
 inkos export 吞天魔帝          # 导出全书
 inkos export 吞天魔帝 --format epub  # 导出 EPUB（手机/Kindle 阅读）
 ```
+
+### 写完整短篇
+
+想直接生成一篇完整短篇，可以在 Studio 对话里说：
+
+```text
+写一篇 12 章短篇，方向是：都市婚姻反转，女主拿到账本证据后反杀。
+```
+
+也可以走 CLI：
+
+```bash
+inkos short run \
+  --direction "都市短篇 婚姻反转 女主证据反杀" \
+  --chapters 12 \
+  --chars 1000
+```
+
+生成物会落在 `shorts/<故事名>/final/`，包含 `full.md`、`sales-package.md`、`cover-prompt.md`，配置封面服务后还会生成 `cover.png`。
+
+### 单独制作封面
+
+如果只想给已有标题或简介做封面，不需要重跑短篇正文，在 Studio 对话里直接说：
+
+```text
+给《她签下离婚协议那天，他悔疯了》生成一张短篇封面，偏现代都市、强反转。
+```
+
+封面工具会独立生成 `covers/<标题>/cover-prompt.md` 和 `covers/<标题>/cover.png`。如果还没有配置封面服务，先在 Studio 的模型配置里设置封面服务和 API Key。
+
+生成后也可以继续通过 chat 改封面提示词，例如“把人物拉近一点、标题字更大、表情更冷笑”。系统会用新的 `coverPrompt` 重写 `cover-prompt.md` 并重生成封面，不需要重新写短篇。
 
 <p align="center">
   <img src="assets/screenshot-terminal.png" width="700" alt="终端截图">
@@ -230,7 +271,7 @@ inkos export 吞天魔帝 --format epub  # 导出 EPUB（手机/Kindle 阅读）
 
 ### 多维度审计 + 去 AI 味
 
-连续性审计员从 33 个维度检查每一章草稿：角色记忆、物资连续性、伏笔回收、大纲偏离、叙事节奏、情感弧线等。内置 AI 痕迹检测维度，自动识别"LLM 味"表达（高频词、句式单调、过度总结），审计不通过自动进入修订循环。
+连续性审计员从 33 个维度检查每一章草稿：角色记忆、物资连续性、伏笔回收、大纲偏离、叙事节奏、情感弧线等。内置 AI 痕迹检测维度，自动识别"LLM 味"表达（高频词、句式单调、过度总结）。默认长篇写作链路最多自动修订一次；如果你更看重自动闭环，可以通过 `writing.reviewRetries` 调整修订轮数。
 
 去 AI 味规则内置于写手 agent 的 prompt 层——词汇疲劳词表、禁用句式、文风指纹注入，从源头减少 AI 生成痕迹。`revise --mode anti-detect` 可对已有章节做专门的反检测改写。
 
@@ -256,7 +297,7 @@ inkos plan chapter 吞天魔帝 --context "本章先把注意力拉回师徒矛�
 inkos compose chapter 吞天魔帝
 ```
 
-这会生成 `story/runtime/chapter-XXXX.intent.md`、`context.json`、`rule-stack.yaml`、`trace.json`。其中 `intent.md` 给人看，其他文件给系统执行和调试。`plan` / `compose` 只编译本地文档和状态，不依赖在线 LLM，可在没配好 API Key 前先验证控制输入。
+这会生成 `story/runtime/chapter-XXXX.intent.md`、`context.json`、`rule-stack.yaml`、`trace.json`。其中 `intent.md` 给人看，其他文件给系统执行和调试。`plan` 会调用 LLM 生成章节意图；`compose` 只编译本地文档和状态，可在没配好 API Key 前先验证控制输入。
 
 ### 字数治理
 
@@ -299,7 +340,7 @@ inkos compose chapter 吞天魔帝
 
 ## 工作原理
 
-每一章由多个 Agent 接力完成，全程零人工干预：
+每一章由多个 Agent 接力完成，默认按“规划 → 编排 → 写作 → 审计 → 必要修订 → 状态同步”运行：
 
 <p align="center">
   <img src="assets/screenshot-pipeline.png" width="800" alt="管线流程图">
@@ -310,15 +351,15 @@ inkos compose chapter 吞天魔帝
 | **雷达 Radar** | 扫描平台趋势和读者偏好，指导故事方向（可插拔，可跳过） |
 | **规划师 Planner** | 读取作者意图 + 当前焦点 + 记忆检索结果，产出本章意图（must-keep / must-avoid） |
 | **编排师 Composer** | 从全量真相文件中按相关性选择上下文，编译规则栈和运行时产物 |
-| **建筑师 Architect** | 规划章节结构：大纲、场景节拍、节奏控制 |
+| **建筑师 Architect** | 建书、导入或番外初始化时生成基础设定：故事框架、规则、角色与长期控制文件 |
 | **写手 Writer** | 基于编排后的精简上下文生成正文（字数治理 + 对话引导） |
 | **观察者 Observer** | 从正文中过度提取 9 类事实（角色、位置、资源、关系、情感、信息、伏笔、时间、物理状态） |
 | **反射器 Reflector** | 输出 JSON delta（而非全量 markdown），由代码层做 Zod schema 校验后 immutable 写入 |
-| **归一化器 Normalizer** | 单 pass 压缩/扩展，将章节字数拉入允许区间 |
+| **归一化器 Normalizer** | 仅在正文明显偏离 hard range 时单 pass 压缩/扩展 |
 | **连续性审计员 Auditor** | 对照 7 个真相文件验证草稿，33 维度检查 |
-| **修订者 Reviser** | 修复审计发现的问题 — 关键问题自动修复，其他标记给人工审核 |
+| **修订者 Reviser** | 修复审计发现的关键问题；默认最多自动修订一次，可通过 `writing.reviewRetries` 调整，其他问题标记给人工审核 |
 
-如果审计不通过，管线自动进入"修订 → 再审计"循环，直到所有关键问题清零。
+如果审计不通过，默认管线只做一次"修订 → 再审计"；仍未解决的问题会保留在结果和状态里，交给人工或后续命令继续处理。需要更强自动闭环时，可以运行 `inkos config set writing.reviewRetries 3` 把修订轮数调高。
 
 ### 长期记忆
 
@@ -370,11 +411,11 @@ InkOS 提供三种交互方式，底层共享同一组原子操作：
 ### 1. 完整管线（一键式）
 
 ```bash
-inkos write next 吞天魔帝          # 写草稿 → 审计 → 自动修订，一步到位
+inkos write next 吞天魔帝          # 写草稿 → 审计 → 按配置自动修订
 inkos write next 吞天魔帝 --count 5 # 连续写 5 章
 ```
 
-`write next` 现在默认走 `plan -> compose -> write` 的输入治理链路。若你需要回退到旧的 prompt 拼装路径，可在 `inkos.json` 中显式设置：
+`write next` 现在默认走 `plan -> compose -> write` 的输入治理链路，审计后的自动修订轮数默认是 1。若你需要回退到旧的 prompt 拼装路径，可在 `inkos.json` 中显式设置：
 
 ```json
 {
@@ -465,7 +506,7 @@ inkos agent "先扫描市场趋势，然后根据结果创建一本新书"
 | `inkos studio` / `inkos` | 启动 Web 工作台（`-p` 指定端口，默认 4567；Studio 使用服务页配置，不使用 env 覆盖） |
 | `inkos up / down` | 启动/停止守护进程（`-q` 静默模式，自动写入 `inkos.log`） |
 
-`[id]` 参数在项目只有一本书时可省略，自动检测。所有命令支持 `--json` 输出结构化数据。`draft` / `write next` / `plan chapter` / `compose chapter` 支持 `--context` 传入创作指导，`--words` 覆盖每章目标字数。`book create` 支持 `--brief <file>` 传入创作简报（你的脑洞/设定文档），Architect 会基于此生成设定而非凭空创作。`plan chapter` / `compose chapter` 不要求在线 LLM，可在配置 API Key 之前先检查输入治理结果。
+`[id]` 参数在项目只有一本书时可省略，自动检测。所有命令支持 `--json` 输出结构化数据。`draft` / `write next` / `plan chapter` / `compose chapter` 支持 `--context` 传入创作指导，`--words` 覆盖每章目标字数。`book create` 支持 `--brief <file>` 传入创作简报（你的脑洞/设定文档），Architect 会基于此生成设定而非凭空创作。`plan chapter` 会调用 LLM 生成章节意图；`compose chapter` 不要求在线 LLM，可在配置 API Key 之前先检查输入治理结果。
 
 CLI 运行时还支持一次性 LLM 覆盖参数：`--service`、`--model`、`--api-key-env`、`--base-url`、`--api-format <chat|responses>`、`--stream`、`--no-stream`。例如：
 

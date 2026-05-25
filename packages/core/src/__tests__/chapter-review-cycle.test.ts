@@ -153,6 +153,7 @@ describe("runChapterReviewCycle v9", () => {
       createReviser: () => ({ reviseChapter }),
       auditor: { auditChapter },
       normalizeDraftLengthIfNeeded,
+      maxReviewIterations: 2,
     });
 
     // Should have attempted 2 revisions:
@@ -165,6 +166,64 @@ describe("runChapterReviewCycle v9", () => {
     expect(result.auditResult.overallScore).toBe(80);
     expect(result.finalContent).toBe("a".repeat(200));
     expect(result.revised).toBe(true);
+  });
+
+  it("defaults to one automatic repair pass", async () => {
+    const auditChapter = vi.fn()
+      .mockResolvedValueOnce(createAuditResult({
+        passed: false,
+        overallScore: 70,
+        issues: [{ severity: "critical", category: "continuity", description: "broken", suggestion: "fix" }],
+      }))
+      .mockResolvedValueOnce(createAuditResult({
+        passed: false,
+        overallScore: 80,
+        issues: [{ severity: "warning", category: "pacing", description: "slow", suggestion: "trim" }],
+      }))
+      .mockResolvedValueOnce(createAuditResult({
+        passed: true,
+        overallScore: 90,
+      }));
+
+    const reviseChapter = vi.fn()
+      .mockResolvedValueOnce({
+        revisedContent: "a".repeat(200),
+        wordCount: 200,
+        fixedIssues: ["fixed continuity"],
+        updatedState: "", updatedLedger: "", updatedHooks: "",
+        tokenUsage: ZERO_USAGE,
+      })
+      .mockResolvedValueOnce({
+        revisedContent: "b".repeat(200),
+        wordCount: 200,
+        fixedIssues: ["trimmed pacing"],
+        updatedState: "", updatedLedger: "", updatedHooks: "",
+        tokenUsage: ZERO_USAGE,
+      });
+
+    const normalizeDraftLengthIfNeeded = vi.fn()
+      .mockImplementation(async (content: string) => ({
+        content,
+        wordCount: content.length,
+        applied: false,
+        tokenUsage: ZERO_USAGE,
+      }));
+
+    const result = await runChapterReviewCycle({
+      ...baseParams,
+      initialOutput: {
+        content: "c".repeat(200),
+        wordCount: 200,
+        postWriteErrors: [],
+      },
+      createReviser: () => ({ reviseChapter }),
+      auditor: { auditChapter },
+      normalizeDraftLengthIfNeeded,
+    });
+
+    expect(reviseChapter).toHaveBeenCalledTimes(1);
+    expect(result.auditResult.overallScore).toBe(80);
+    expect(result.finalContent).toBe("a".repeat(200));
   });
 
   it("stops immediately when initial score passes threshold", async () => {

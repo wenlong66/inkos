@@ -37,13 +37,17 @@ import {
   chatCompletion,
   buildExportArtifact,
   GLOBAL_ENV_PATH,
+  COVER_PROVIDER_PRESETS,
+  Scheduler,
+  coverSecretKey,
+  resolveCoverProviderPreset,
   type ResolvedModel,
   type PipelineConfig,
   type ProjectConfig,
   type LogSink,
   type LogEntry,
 } from "@actalk/inkos-core";
-import { access, readFile, readdir, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { isSafeBookId } from "./safety.js";
 import { ApiError } from "./errors.js";
@@ -74,6 +78,8 @@ const AGENT_LABELS: Record<string, string> = {
 };
 const TOOL_LABELS: Record<string, string> = {
   read: "读取文件", edit: "编辑文件", grep: "搜索", ls: "列目录",
+  short_fiction_run: "短篇生产",
+  generate_cover: "生成封面",
 };
 
 function resolveToolLabel(tool: string, agent?: string): string {
@@ -91,6 +97,24 @@ function summarizeResult(result: unknown): string {
   return String(result).slice(0, 200);
 }
 
+function compareServiceListItems(
+  left: { readonly service: string },
+  right: { readonly service: string },
+): number {
+  const priority = ["kkaiapi", "openrouter", "newapi", "siliconcloud"];
+  const leftPriority = priority.indexOf(left.service);
+  const rightPriority = priority.indexOf(right.service);
+  if (leftPriority !== -1 || rightPriority !== -1) {
+    return (leftPriority === -1 ? 999 : leftPriority) - (rightPriority === -1 ? 999 : rightPriority);
+  }
+  return 0;
+}
+
+function isHeaderSafeApiKey(value: string): boolean {
+  if (!value) return true;
+  return /^[\x21-\x7E]+$/.test(value);
+}
+
 const NON_TEXT_MODEL_ID_PARTS = [
   "image",
   "embedding",
@@ -101,6 +125,11 @@ const NON_TEXT_MODEL_ID_PARTS = [
   "audio",
   "moderation",
 ] as const;
+
+const SERVICE_MODELS_PROBE_TIMEOUT_MS = 4_000;
+const SERVICE_CHAT_PROBE_TIMEOUT_MS = 8_000;
+const MAX_DISCOVERED_MODELS_TO_PING = 2;
+const MAX_GENERIC_FALLBACK_MODELS_TO_PING = 2;
 
 function isTextChatModelId(modelId: string): boolean {
   const normalized = modelId.trim().toLowerCase();
@@ -144,6 +173,46 @@ function extractToolError(result: unknown): string {
   return String(result).slice(0, 500);
 }
 
+function resolveProjectImageFile(root: string, rawPath: string): { readonly resolved: string; readonly contentType: string } {
+  let relPath: string;
+  try {
+    relPath = decodeURIComponent(rawPath).replace(/^\/+/u, "");
+  } catch {
+    throw new ApiError(400, "INVALID_PROJECT_FILE_PATH", "Invalid project file path");
+  }
+
+  if (
+    !relPath
+    || relPath.includes("\0")
+    || isAbsolute(relPath)
+    || relPath.split(/[\\/]+/u).includes("..")
+  ) {
+    throw new ApiError(400, "INVALID_PROJECT_FILE_PATH", "Invalid project file path");
+  }
+  if (!relPath.startsWith("shorts/") && !relPath.startsWith("covers/")) {
+    throw new ApiError(400, "INVALID_PROJECT_FILE_PATH", "Only generated shorts/ and covers/ images can be previewed");
+  }
+
+  const ext = relPath.split(".").pop()?.toLowerCase() ?? "";
+  const contentTypes: Record<string, string> = {
+    png: "image/png",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    webp: "image/webp",
+  };
+  const contentType = contentTypes[ext];
+  if (!contentType) {
+    throw new ApiError(415, "UNSUPPORTED_PROJECT_FILE_TYPE", "Unsupported project file type");
+  }
+
+  const resolved = resolve(root, relPath);
+  const rel = relative(root, resolved);
+  if (!rel || rel.startsWith("..") || isAbsolute(rel)) {
+    throw new ApiError(400, "INVALID_PROJECT_FILE_PATH", "Invalid project file path");
+  }
+  return { resolved, contentType };
+}
+
 function isLikelyFailedToolResult(exec: CollectedToolExec): boolean {
   if (exec.status === "error") return true;
   const text = `${exec.error ?? ""}\n${exec.result ?? ""}`.toLowerCase();
@@ -166,6 +235,206 @@ function isWriteNextInstruction(instruction: string): boolean {
   const trimmed = instruction.trim();
   return /^(continue|继续|继续写|写下一章|write next|下一章|再来一章)$/i.test(trimmed)
     || /(继续写|写下一章|下一章|再来一章|write\s+next)/i.test(trimmed);
+}
+
+type ExternalChatEditResult = {
+  readonly responseText: string;
+  readonly activeBookId?: string;
+};
+
+const CHAT_EDIT_WARNING = "[warning] Chat external edit requires review before continuation.";
+const CHAT_EDIT_TEXT_EXTENSIONS = /\.(md|txt|json|ya?ml)$/i;
+const CHAT_EDIT_ALLOWED_ROOTS = new Set(["books", "shorts", "covers", "genres"]);
+
+function parseReplacementInstruction(instruction: string): { oldText: string; newText: string } | null {
+  const inFileQuoted = instruction.match(/(?:里|里的|中|中的|里面)\s*[「“"]([\s\S]+?)[」”"]\s*(?:改成|替换成|换成)\s*[「“"]([\s\S]+?)[」”"]/);
+  if (inFileQuoted?.[1] && inFileQuoted[2] !== undefined) {
+    return { oldText: inFileQuoted[1], newText: inFileQuoted[2] };
+  }
+  const quoted = instruction.match(/(?:把|将)\s*[「“"]([\s\S]+?)[」”"]\s*(?:改成|替换成|换成)\s*[「“"]([\s\S]+?)[」”"]/);
+  if (quoted?.[1] && quoted[2] !== undefined) {
+    return { oldText: quoted[1], newText: quoted[2] };
+  }
+  const plain = instruction.match(/(?:把|将)\s+([^\s，。；;]+)\s*(?:改成|替换成|换成)\s+([^\n，。；;]+)/);
+  if (plain?.[1] && plain[2] !== undefined) {
+    return { oldText: plain[1], newText: plain[2].trim() };
+  }
+  return null;
+}
+
+function parseChapterNumberForEdit(instruction: string): number | null {
+  const match = instruction.match(/第\s*(\d{1,4})\s*章/);
+  if (!match?.[1]) return null;
+  const chapterNumber = Number.parseInt(match[1], 10);
+  return Number.isInteger(chapterNumber) && chapterNumber > 0 ? chapterNumber : null;
+}
+
+function parseExplicitEditPath(instruction: string): string | null {
+  const match = instruction.match(/(?:把|将)\s+([^「“"\s，。；;]+?\.[A-Za-z0-9]+)\s*(?:里|里的|中|中的|里面)/);
+  return match?.[1]?.trim() ?? null;
+}
+
+function countContentUnits(content: string): number {
+  const stripped = content
+    .replace(/^#{1,6}\s+.*$/gm, "")
+    .trim();
+  if (!stripped) return 0;
+  if (/[\u3400-\u9fff]/.test(stripped)) {
+    return stripped.replace(/\s/g, "").length;
+  }
+  return stripped.split(/\s+/).filter(Boolean).length;
+}
+
+function resolveExternalChatEditPath(root: string, requestedPath: string): { path: string; rel: string } {
+  if (isAbsolute(requestedPath)) {
+    throw new ApiError(400, "UNSUPPORTED_CHAT_EDIT_TARGET", "Chat external edits only support project-relative content paths.");
+  }
+  const projectRoot = resolve(root);
+  const resolved = resolve(projectRoot, requestedPath);
+  const rel = relative(projectRoot, resolved).replace(/\\/g, "/");
+  if (!rel || rel.startsWith("../") || rel === "..") {
+    throw new ApiError(400, "UNSUPPORTED_CHAT_EDIT_TARGET", "Chat external edit path escapes the project root.");
+  }
+  const first = rel.split("/")[0] ?? "";
+  if (!CHAT_EDIT_ALLOWED_ROOTS.has(first)) {
+    throw new ApiError(400, "UNSUPPORTED_CHAT_EDIT_TARGET", "Chat external edits cannot modify source code, config, or arbitrary project files.");
+  }
+  if (rel.includes("/.inkos/") || rel.endsWith("/.inkos") || rel.includes("/secrets") || rel.endsWith(".env")) {
+    throw new ApiError(400, "UNSUPPORTED_CHAT_EDIT_TARGET", "Chat external edits cannot modify secrets or runtime internals.");
+  }
+  if (!CHAT_EDIT_TEXT_EXTENSIONS.test(rel)) {
+    throw new ApiError(400, "UNSUPPORTED_CHAT_EDIT_TARGET", "Chat external edits only support text content files.");
+  }
+  return { path: resolved, rel };
+}
+
+async function findChapterFile(root: string, bookId: string, chapterNumber: number): Promise<string | null> {
+  const chaptersDir = join(root, "books", bookId, "chapters");
+  const padded = String(chapterNumber).padStart(4, "0");
+  const files = await readdir(chaptersDir).catch(() => []);
+  const match = files.find((file) => file.startsWith(`${padded}_`) && file.endsWith(".md"));
+  return match ? join(chaptersDir, match) : null;
+}
+
+function parseBookChapterFromRelativePath(rel: string): { bookId: string; chapterNumber: number } | null {
+  const match = rel.match(/^books\/([^/]+)\/chapters\/(\d{4})_[^/]+\.md$/);
+  if (!match?.[1] || !match[2]) return null;
+  const chapterNumber = Number.parseInt(match[2], 10);
+  return Number.isInteger(chapterNumber) ? { bookId: match[1], chapterNumber } : null;
+}
+
+async function syncExternalChapterEdit(params: {
+  readonly state: StateManager;
+  readonly root: string;
+  readonly bookId: string;
+  readonly chapterNumber: number;
+  readonly content: string;
+}): Promise<void> {
+  const now = new Date().toISOString();
+  const index = [...(await params.state.loadChapterIndex(params.bookId))];
+  const updated = index.map((chapter) => chapter.number === params.chapterNumber
+    ? {
+        ...chapter,
+        status: "audit-failed" as const,
+        wordCount: countContentUnits(params.content),
+        updatedAt: now,
+        auditIssues: [
+          ...chapter.auditIssues.filter((issue) => issue !== CHAT_EDIT_WARNING),
+          CHAT_EDIT_WARNING,
+        ],
+      }
+    : chapter);
+  if (updated.length > 0) {
+    await params.state.saveChapterIndex(params.bookId, updated);
+  }
+
+  const runtimeDir = join(params.root, "books", params.bookId, "story", "runtime");
+  const padded = String(params.chapterNumber).padStart(4, "0");
+  const runtimeFiles = await readdir(runtimeDir).catch(() => []);
+  await Promise.all(
+    runtimeFiles
+      .filter((file) => file.startsWith(`chapter-${padded}.`))
+      .map((file) => rm(join(runtimeDir, file), { force: true })),
+  );
+}
+
+async function tryHandleExternalChatEdit(params: {
+  readonly root: string;
+  readonly state: StateManager;
+  readonly instruction: string;
+  readonly activeBookId: string | null;
+}): Promise<ExternalChatEditResult | null> {
+  const replacement = parseReplacementInstruction(params.instruction);
+  if (!replacement) return null;
+
+  const explicitPath = parseExplicitEditPath(params.instruction);
+  if (explicitPath) {
+    const target = resolveExternalChatEditPath(params.root, explicitPath);
+    const content = await readFile(target.path, "utf-8").catch((error) => {
+      throw new ApiError(404, "CHAT_EDIT_TARGET_NOT_FOUND", error instanceof Error ? error.message : String(error));
+    });
+    const first = content.indexOf(replacement.oldText);
+    if (first === -1) {
+      throw new ApiError(400, "EDIT_TARGET_NOT_FOUND", "要替换的原文没有在目标文件中找到。");
+    }
+    if (content.indexOf(replacement.oldText, first + replacement.oldText.length) !== -1) {
+      throw new ApiError(400, "EDIT_TARGET_AMBIGUOUS", "要替换的原文出现多次，请给出更具体的一段。");
+    }
+    const updated = content.slice(0, first) + replacement.newText + content.slice(first + replacement.oldText.length);
+    await writeFile(target.path, updated, "utf-8");
+
+    const chapterTarget = parseBookChapterFromRelativePath(target.rel);
+    if (chapterTarget) {
+      await syncExternalChapterEdit({
+        state: params.state,
+        root: params.root,
+        bookId: chapterTarget.bookId,
+        chapterNumber: chapterTarget.chapterNumber,
+        content: updated,
+      });
+    }
+
+    return {
+      activeBookId: chapterTarget?.bookId ?? params.activeBookId ?? undefined,
+      responseText: `已直接编辑 ${target.rel}${chapterTarget ? "，并标记为需要复核" : ""}。`,
+    };
+  }
+
+  if (!params.activeBookId) return null;
+  const chapterNumber = parseChapterNumberForEdit(params.instruction);
+  if (!replacement || !chapterNumber) return null;
+
+  const chapterPath = await findChapterFile(params.root, params.activeBookId, chapterNumber);
+  if (!chapterPath) {
+    throw new ApiError(404, "CHAPTER_NOT_FOUND", `Chapter ${chapterNumber} not found in ${params.activeBookId}`);
+  }
+  if (!CHAT_EDIT_TEXT_EXTENSIONS.test(chapterPath)) {
+    throw new ApiError(400, "UNSUPPORTED_EDIT_TARGET", "Chat external edits only support text files.");
+  }
+
+  const content = await readFile(chapterPath, "utf-8");
+  const first = content.indexOf(replacement.oldText);
+  if (first === -1) {
+    throw new ApiError(400, "EDIT_TARGET_NOT_FOUND", "要替换的原文没有在目标章节中找到。");
+  }
+  if (content.indexOf(replacement.oldText, first + replacement.oldText.length) !== -1) {
+    throw new ApiError(400, "EDIT_TARGET_AMBIGUOUS", "要替换的原文出现多次，请给出更具体的一段。");
+  }
+
+  const updated = content.slice(0, first) + replacement.newText + content.slice(first + replacement.oldText.length);
+  await writeFile(chapterPath, updated, "utf-8");
+  await syncExternalChapterEdit({
+    state: params.state,
+    root: params.root,
+    bookId: params.activeBookId,
+    chapterNumber,
+    content: updated,
+  });
+
+  return {
+    activeBookId: params.activeBookId,
+    responseText: `已直接编辑 ${params.activeBookId} 第 ${chapterNumber} 章，并标记为需要复核。`,
+  };
 }
 
 function looksLikeBookCreatedClaim(responseText: string): boolean {
@@ -397,6 +666,39 @@ function mergeServiceConfig(existing: ServiceConfigEntry[], updates: ServiceConf
   return [...merged.values()];
 }
 
+function normalizeCoverConfig(raw: unknown): { service: string; model: string } | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const record = raw as Record<string, unknown>;
+  const service = typeof record.service === "string" ? record.service : "";
+  const preset = resolveCoverProviderPreset(service);
+  if (!preset) return undefined;
+  const requestedModel = typeof record.model === "string" ? record.model.trim() : "";
+  const model = requestedModel && preset.models.includes(requestedModel)
+    ? requestedModel
+    : preset.defaultModel;
+  return { service: preset.service, model };
+}
+
+function syncTopLevelLlmMirror(llm: Record<string, unknown>): void {
+  const selectedService = typeof llm.service === "string" ? llm.service : undefined;
+  if (!selectedService) return;
+
+  const services = normalizeServiceConfig(llm.services);
+  const selectedEntry = services.find((entry) => serviceConfigKey(entry) === selectedService)
+    ?? (!isCustomServiceId(selectedService) ? { service: selectedService } : undefined);
+  if (!selectedEntry) return;
+
+  const preset = resolveServicePreset(selectedEntry.service);
+  llm.provider = resolveServiceProviderFamily(selectedEntry.service) ?? "openai";
+  llm.baseUrl = selectedEntry.baseUrl ?? preset?.baseUrl ?? "";
+
+  const defaultModel = typeof llm.defaultModel === "string" ? llm.defaultModel.trim() : "";
+  if (defaultModel) llm.model = defaultModel;
+  if (selectedEntry.temperature !== undefined) llm.temperature = selectedEntry.temperature;
+  if (selectedEntry.apiFormat !== undefined) llm.apiFormat = selectedEntry.apiFormat;
+  if (selectedEntry.stream !== undefined) llm.stream = selectedEntry.stream;
+}
+
 async function loadRawConfig(root: string): Promise<Record<string, unknown>> {
   const configPath = join(root, "inkos.json");
   const raw = await readFile(configPath, "utf-8");
@@ -498,15 +800,12 @@ function buildProbePlans(
 
   if (preferredApiFormat) {
     push(preferredApiFormat, preferredStream ?? false);
-    push(preferredApiFormat, !(preferredStream ?? false));
+    if (preferredStream) push(preferredApiFormat, false);
+    return candidates;
   }
-  const alternate = preferredApiFormat === "responses" ? "chat" : "responses";
-  push(alternate, false);
-  push(alternate, true);
+
   push("chat", false);
-  push("chat", true);
   push("responses", false);
-  push("responses", true);
   return candidates;
 }
 
@@ -530,14 +829,115 @@ function buildModelCandidates(args: {
   push(args.preferredModel);
   push(args.configModel);
   push(args.envModel ?? undefined);
-  for (const model of args.discoveredModels) push(model.id);
+  for (const model of args.discoveredModels.slice(0, MAX_DISCOVERED_MODELS_TO_PING)) push(model.id);
   if (args.includeGenericFallbacks === false) return candidates;
-  push("gpt-5.4");
-  push("gpt-4o");
-  push("claude-sonnet-4-6");
-  push("MiniMax-M2.7");
-  push("kimi-k2.5");
+  for (const fallback of [
+    "gpt-5.4",
+    "gpt-4o",
+    "claude-sonnet-4-6",
+    "MiniMax-M2.7",
+    "kimi-k2.5",
+  ].slice(0, MAX_GENERIC_FALLBACK_MODELS_TO_PING)) {
+    push(fallback);
+  }
   return candidates;
+}
+
+function yamlScalar(value: unknown): string {
+  return JSON.stringify(String(value ?? ""));
+}
+
+function radarTimestampForFilename(value: string | undefined): string {
+  const date = value ? new Date(value) : new Date();
+  const safeDate = Number.isNaN(date.getTime()) ? new Date() : date;
+  return safeDate.toISOString().replace(/[:.]/g, "-");
+}
+
+async function saveRadarScan(root: string, result: unknown): Promise<string> {
+  const radarDir = join(root, "radar");
+  await mkdir(radarDir, { recursive: true });
+  const timestamp = typeof result === "object" && result !== null && "timestamp" in result
+    ? String((result as { timestamp?: unknown }).timestamp ?? "")
+    : "";
+  const fileName = `scan-${radarTimestampForFilename(timestamp)}.json`;
+  const filePath = join(radarDir, fileName);
+  await writeFile(filePath, JSON.stringify(result, null, 2), "utf-8");
+  return filePath;
+}
+
+async function loadRadarHistory(root: string): Promise<Array<{
+  readonly file: string;
+  readonly timestamp: string;
+  readonly marketSummary: string;
+  readonly summaryPreview: string;
+  readonly result: unknown;
+}>> {
+  const radarDir = join(root, "radar");
+  let files: string[] = [];
+  try {
+    files = await readdir(radarDir);
+  } catch {
+    return [];
+  }
+
+  const scans = await Promise.all(
+    files
+      .filter((file) => /^scan-.+\.json$/.test(file))
+      .map(async (file) => {
+        try {
+          const raw = await readFile(join(radarDir, file), "utf-8");
+          const result = JSON.parse(raw) as { timestamp?: unknown; marketSummary?: unknown };
+          const timestamp = typeof result.timestamp === "string"
+            ? result.timestamp
+            : file.replace(/^scan-/, "").replace(/\.json$/, "");
+          const marketSummary = typeof result.marketSummary === "string" ? result.marketSummary : "";
+          return {
+            file,
+            timestamp,
+            marketSummary,
+            summaryPreview: marketSummary.slice(0, 100),
+            result,
+          };
+        } catch {
+          return null;
+        }
+      }),
+  );
+
+  return scans
+    .filter((item): item is NonNullable<typeof item> => item !== null)
+    .sort((a, b) => b.file.localeCompare(a.file));
+}
+
+function fallbackTextModelsForEndpoint(
+  endpoint: ReturnType<typeof getAllEndpoints>[number] | undefined,
+  preset: ReturnType<typeof resolveServicePreset> | undefined,
+): Array<{ id: string; name: string }> {
+  const endpointModels = endpoint?.models
+    .filter((model) => model.enabled !== false)
+    .filter((model) => isTextChatModelId(model.id))
+    .map((model) => ({ id: model.id, name: model.id }))
+    ?? [];
+  if (endpointModels.length > 0) return endpointModels;
+  return preset?.knownModels?.map((id) => ({ id, name: id })) ?? [];
+}
+
+function shouldTrustStaticModelsWhenLiveListUnavailable(endpoint: ReturnType<typeof getAllEndpoints>[number] | undefined): boolean {
+  return endpoint?.group === "aggregator";
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(`${label} 超时（${timeoutMs}ms）`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
 }
 
 function formatServiceProbeError(args: {
@@ -610,8 +1010,8 @@ async function fetchModelsFromServiceBaseUrl(
   const modelsUrl = modelsBaseUrl.replace(/\/$/, "") + "/models";
   try {
     const res = await fetchWithProxy(modelsUrl, {
-      headers: { Authorization: `Bearer ${apiKey}` },
-      signal: AbortSignal.timeout(10_000),
+      headers: buildBearerAuthHeaders(apiKey),
+      signal: AbortSignal.timeout(SERVICE_MODELS_PROBE_TIMEOUT_MS),
     }, proxyUrl);
     if (!res.ok) {
       const body = await res.text().catch(() => "");
@@ -631,6 +1031,15 @@ async function fetchModelsFromServiceBaseUrl(
       error: error instanceof Error ? error.message : String(error),
     };
   }
+}
+
+function buildBearerAuthHeaders(apiKey: string | undefined): Record<string, string> {
+  const trimmed = apiKey?.trim() ?? "";
+  if (!trimmed) return {};
+  if (!/^[\x20-\x7e]+$/.test(trimmed)) {
+    throw new Error("API Key 只能包含英文、数字和常见 ASCII 符号，请检查是否误粘贴了中文说明。");
+  }
+  return { Authorization: `Bearer ${trimmed}` };
 }
 
 async function probeServiceCapabilities(args: {
@@ -667,10 +1076,45 @@ async function probeServiceCapabilities(args: {
   const discoveredFirstModel =
     discoveredModels.find((model) => isTextChatModelId(model.id))?.id
     ?? discoveredModels[0]?.id;
+  if (discoveredModels.length > 0) {
+    if (!discoveredFirstModel || !isTextChatModelId(discoveredFirstModel)) {
+      return {
+        ok: false,
+        models: discoveredModels,
+        error: "模型列表可访问，但没有发现可用于文本对话的模型。",
+      };
+    }
+    return {
+      ok: true,
+      models: discoveredModels,
+      selectedModel: discoveredFirstModel,
+      apiFormat: args.preferredApiFormat ?? "chat",
+      stream: args.preferredStream ?? false,
+      baseUrl: args.baseUrl,
+      modelsSource: "api",
+    };
+  }
+  if (shouldTrustStaticModelsWhenLiveListUnavailable(endpoint)) {
+    const models = fallbackTextModelsForEndpoint(endpoint, preset);
+    const selectedModel =
+      endpoint?.checkModel && models.some((model) => model.id === endpoint.checkModel)
+        ? endpoint.checkModel
+        : models[0]?.id;
+    if (selectedModel) {
+      return {
+        ok: true,
+        models,
+        selectedModel,
+        apiFormat: args.preferredApiFormat ?? "chat",
+        stream: args.preferredStream ?? false,
+        baseUrl: args.baseUrl,
+        modelsSource: "fallback",
+      };
+    }
+  }
   // Prefer live /models results; if unavailable, probe with the service's own check model before global defaults.
   const serviceFirstModel =
-    discoveredFirstModel
-    ?? endpoint?.checkModel
+    endpoint?.checkModel
     ?? preset?.knownModels?.[0]
     ?? endpoint?.models.find((model) => model.enabled !== false)?.id;
   const useDynamicLocalModels = baseService === "ollama";
@@ -686,7 +1130,7 @@ async function probeServiceCapabilities(args: {
         ? llm.model
         : undefined
     : undefined;
-  const useCustomFallbacks = isCustomServiceId(args.service);
+  const useCustomFallbacks = false;
   const modelCandidates = buildModelCandidates({
     preferredModel: args.preferredModel ?? serviceFirstModel,
     configModel,
@@ -715,7 +1159,7 @@ async function probeServiceCapabilities(args: {
         apiKey: args.apiKey.trim(),
         model,
         temperature: 0.7,
-        maxTokens: 2048,
+        maxTokens: 16,
         thinkingBudget: 0,
         proxyUrl: args.proxyUrl,
         apiFormat: plan.apiFormat,
@@ -723,18 +1167,17 @@ async function probeServiceCapabilities(args: {
       } as ProjectConfig["llm"]);
 
       try {
-        await chatCompletion(client, model, [{ role: "user", content: "ping" }], { maxTokens: 2048 });
+        await withTimeout(
+          chatCompletion(client, model, [{ role: "user", content: "Reply with OK only." }], { maxTokens: 16 }),
+          SERVICE_CHAT_PROBE_TIMEOUT_MS,
+          "service connection test",
+        );
         const models = discoveredModels.length > 0
           ? discoveredModels
-          : endpoint?.models
-            .filter((m) => m.enabled !== false)
-            .filter((m) => isTextChatModelId(m.id))
-            .map((m) => ({ id: m.id, name: m.id }))
-            ?? preset?.knownModels?.map((id) => ({ id, name: id }))
-            ?? [{ id: model, name: model }];
+          : fallbackTextModelsForEndpoint(endpoint, preset);
         return {
           ok: true,
-          models,
+          models: models.length > 0 ? models : [{ id: model, name: model }],
           selectedModel: model,
           apiFormat: plan.apiFormat,
           stream: plan.stream,
@@ -854,6 +1297,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
       projectRoot: root,
       defaultLLMConfig: currentConfig.llm,
       foundationReviewRetries: currentConfig.foundation?.reviewRetries ?? 2,
+      writingReviewRetries: currentConfig.writing?.reviewRetries ?? 1,
       modelOverrides: currentConfig.modelOverrides,
       notifyChannels: currentConfig.notify,
       logger,
@@ -1260,7 +1704,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
       label: ep.label,
       group: ep.group,
       connected: Boolean(secrets.services[ep.id]?.apiKey),
-    }));
+    })).sort(compareServiceListItems);
 
     // Add custom services from inkos.json
     try {
@@ -1320,8 +1764,103 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     if (body.service !== undefined) {
       llm.service = body.service;
     }
+    syncTopLevelLlmMirror(llm);
     await saveRawConfig(root, config);
     return c.json({ ok: true });
+  });
+
+  app.get("/api/v1/cover/config", async (c) => {
+    const config = await loadRawConfig(root);
+    const llm = (config.llm as Record<string, unknown> | undefined) ?? {};
+    const cover = normalizeCoverConfig(llm.cover);
+    const secrets = await loadSecrets(root);
+    return c.json({
+      service: cover?.service ?? null,
+      model: cover?.model ?? null,
+      providers: COVER_PROVIDER_PRESETS.map((provider) => ({
+        service: provider.service,
+        label: provider.label,
+        baseUrl: provider.baseUrl,
+        defaultModel: provider.defaultModel,
+        models: provider.models,
+        connected: Boolean(secrets.services[coverSecretKey(provider.service)]?.apiKey || secrets.services[provider.service]?.apiKey),
+      })),
+    });
+  });
+
+  app.put("/api/v1/cover/config", async (c) => {
+    const body = await c.req.json<{ service?: string; model?: string }>();
+    const preset = resolveCoverProviderPreset(body.service);
+    if (!preset) {
+      return c.json({ error: "Unsupported cover service" }, 400);
+    }
+    const model = typeof body.model === "string" && preset.models.includes(body.model)
+      ? body.model
+      : preset.defaultModel;
+
+    const config = await loadRawConfig(root);
+    config.llm = config.llm ?? {};
+    const llm = config.llm as Record<string, unknown>;
+    llm.cover = {
+      service: preset.service,
+      model,
+    };
+    await saveRawConfig(root, config);
+    return c.json({ ok: true, service: preset.service, model });
+  });
+
+  app.get("/api/v1/cover/secret/:service", async (c) => {
+    const service = c.req.param("service");
+    if (!resolveCoverProviderPreset(service)) {
+      return c.json({ error: "Unsupported cover service" }, 400);
+    }
+    const secrets = await loadSecrets(root);
+    return c.json({ apiKey: secrets.services[coverSecretKey(service)]?.apiKey ?? "" });
+  });
+
+  app.put("/api/v1/cover/secret/:service", async (c) => {
+    const service = c.req.param("service");
+    if (!resolveCoverProviderPreset(service)) {
+      return c.json({ error: "Unsupported cover service" }, 400);
+    }
+    const body = await c.req.json<{ apiKey?: string }>();
+    const trimmedKey = body.apiKey?.trim() ?? "";
+    if (trimmedKey && !isHeaderSafeApiKey(trimmedKey)) {
+      return c.json({ error: "API Key 包含不能放入 HTTP Authorization header 的字符，请只粘贴原始密钥。" }, 400);
+    }
+
+    const secrets = await loadSecrets(root);
+    const key = coverSecretKey(service);
+    if (trimmedKey) {
+      secrets.services[key] = { apiKey: trimmedKey };
+    } else {
+      delete secrets.services[key];
+    }
+    await saveSecrets(root, secrets);
+    return c.json({ ok: true, service });
+  });
+
+  app.delete("/api/v1/services/:service", async (c) => {
+    const service = c.req.param("service");
+    const config = await loadRawConfig(root);
+    const llm = (config.llm as Record<string, unknown> | undefined) ?? {};
+    const existingServices = normalizeServiceConfig(llm.services);
+    const nextServices = existingServices.filter((entry) => serviceConfigKey(entry) !== service);
+
+    if (!config.llm) config.llm = {};
+    const nextLlm = config.llm as Record<string, unknown>;
+    nextLlm.services = nextServices;
+    if (nextLlm.service === service) {
+      delete nextLlm.service;
+      delete nextLlm.defaultModel;
+    }
+    await saveRawConfig(root, config);
+
+    const secrets = await loadSecrets(root);
+    delete secrets.services[service];
+    await saveSecrets(root, secrets);
+    modelListCache.clear();
+    return c.json({ ok: true, service });
   });
 
   app.post("/api/v1/services/:service/test", async (c) => {
@@ -1344,7 +1883,10 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
       baseUrl: resolvedBaseUrl,
     });
     if (!apiKey?.trim() && !apiKeyOptional) {
-      return c.json({ ok: false, error: "API Key 不能为空" }, 400);
+      return c.json({
+        ok: false,
+        error: "API Key 不能为空",
+      }, 400);
     }
 
     const rawConfig = await loadRawConfig(root).catch(() => ({} as Record<string, unknown>));
@@ -1396,8 +1938,15 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     const service = c.req.param("service");
     const { apiKey } = await c.req.json<{ apiKey: string }>();
     const secrets = await loadSecrets(root);
-    if (apiKey?.trim()) {
-      secrets.services[service] = { apiKey: apiKey.trim() };
+    const trimmedKey = apiKey?.trim() ?? "";
+    if (trimmedKey) {
+      if (!isHeaderSafeApiKey(trimmedKey)) {
+        return c.json({
+          ok: false,
+          error: "API Key 只能包含可放进 HTTP Authorization header 的非空白 ASCII 字符；请不要粘贴连接失败提示或诊断文本。",
+        }, 400);
+      }
+      secrets.services[service] = { apiKey: trimmedKey };
     } else {
       delete secrets.services[service];
     }
@@ -1525,6 +2074,22 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     });
   });
 
+  app.get("/api/v1/project/files/:file{.+}", async (c) => {
+    const file = resolveProjectImageFile(root, c.req.param("file"));
+
+    try {
+      const content = await readFile(file.resolved);
+      return new Response(content, {
+        headers: {
+          "Content-Type": file.contentType,
+          "Cache-Control": "no-store",
+        },
+      });
+    } catch {
+      return c.notFound();
+    }
+  });
+
   // --- Config editing ---
 
   app.put("/api/v1/project", async (c) => {
@@ -1615,7 +2180,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
 
   // --- Daemon control ---
 
-  let schedulerInstance: import("@actalk/inkos-core").Scheduler | null = null;
+  let schedulerInstance: Scheduler | null = null;
 
   app.get("/api/v1/daemon", (c) => {
     return c.json({
@@ -1628,7 +2193,6 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
       return c.json({ error: "Daemon already running" }, 400);
     }
     try {
-      const { Scheduler } = await import("@actalk/inkos-core");
       const currentConfig = await loadCurrentProjectConfig();
       const scheduler = new Scheduler({
         ...(await buildPipelineConfig()),
@@ -1813,6 +2377,41 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
         }
       };
 
+      const externalEdit = await tryHandleExternalChatEdit({
+        root,
+        state,
+        instruction,
+        activeBookId: agentBookId,
+      });
+      if (externalEdit) {
+        await appendManualSessionMessages(root, bookSession.sessionId, [{
+          role: "assistant",
+          content: [{ type: "text", text: externalEdit.responseText }],
+          api: "anthropic-messages",
+          provider: config.llm.provider,
+          model: config.llm.model,
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+          stopReason: "stop",
+          timestamp: Date.now(),
+        }], instruction);
+        await refreshBookSessionFromTranscript();
+        broadcast("agent:complete", { instruction, activeBookId: externalEdit.activeBookId, sessionId: bookSession.sessionId });
+        return c.json({
+          response: externalEdit.responseText,
+          session: {
+            sessionId: bookSession.sessionId,
+            ...(externalEdit.activeBookId ? { activeBookId: externalEdit.activeBookId } : {}),
+          },
+        });
+      }
+
       // Resolve model — multi-service resolution
       let resolvedModel: ResolvedModel["model"] | undefined;
       let resolvedApiKey: string | undefined;
@@ -1956,6 +2555,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
             id: toolCallId,
             tool: "sub_agent",
             result: toolResult,
+            details: toolResult.details,
             isError: false,
           });
           await appendManualSessionMessages(root, bookSession.sessionId, [{
@@ -2098,6 +2698,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
                 id: event.toolCallId,
                 tool: event.toolName,
                 result: event.result,
+                details: exec?.details,
                 isError: event.isError,
               });
             }
@@ -2720,15 +3321,15 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
 
     const frontmatter = [
       "---",
-      `name: ${body.name}`,
-      `id: ${body.id}`,
-      `language: ${body.language ?? "zh"}`,
+      `name: ${yamlScalar(body.name)}`,
+      `id: ${yamlScalar(body.id)}`,
+      `language: ${yamlScalar(body.language ?? "zh")}`,
       `chapterTypes: ${JSON.stringify(body.chapterTypes ?? [])}`,
       `fatigueWords: ${JSON.stringify(body.fatigueWords ?? [])}`,
       `numericalSystem: ${body.numericalSystem ?? false}`,
       `powerScaling: ${body.powerScaling ?? false}`,
       `eraResearch: ${body.eraResearch ?? false}`,
-      `pacingRule: "${body.pacingRule ?? ""}"`,
+      `pacingRule: ${yamlScalar(body.pacingRule ?? "")}`,
       `satisfactionTypes: ${JSON.stringify(body.satisfactionTypes ?? [])}`,
       `auditDimensions: ${JSON.stringify(body.auditDimensions ?? [])}`,
       "---",
@@ -2756,15 +3357,15 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     const p = body.profile;
     const frontmatter = [
       "---",
-      `name: ${p.name ?? genreId}`,
-      `id: ${p.id ?? genreId}`,
-      `language: ${p.language ?? "zh"}`,
+      `name: ${yamlScalar(p.name ?? genreId)}`,
+      `id: ${yamlScalar(p.id ?? genreId)}`,
+      `language: ${yamlScalar(p.language ?? "zh")}`,
       `chapterTypes: ${JSON.stringify(p.chapterTypes ?? [])}`,
       `fatigueWords: ${JSON.stringify(p.fatigueWords ?? [])}`,
       `numericalSystem: ${p.numericalSystem ?? false}`,
       `powerScaling: ${p.powerScaling ?? false}`,
       `eraResearch: ${p.eraResearch ?? false}`,
-      `pacingRule: "${p.pacingRule ?? ""}"`,
+      `pacingRule: ${yamlScalar(p.pacingRule ?? "")}`,
       `satisfactionTypes: ${JSON.stringify(p.satisfactionTypes ?? [])}`,
       `auditDimensions: ${JSON.stringify(p.auditDimensions ?? [])}`,
       "---",
@@ -2950,10 +3551,20 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     try {
       const pipeline = new PipelineRunner(await buildPipelineConfig());
       const result = await pipeline.runRadar();
+      await saveRadarScan(root, result);
       broadcast("radar:complete", { result });
       return c.json(result);
     } catch (e) {
       broadcast("radar:error", { error: String(e) });
+      return c.json({ error: String(e) }, 500);
+    }
+  });
+
+  app.get("/api/v1/radar/history", async (c) => {
+    try {
+      const items = await loadRadarHistory(root);
+      return c.json({ items });
+    } catch (e) {
       return c.json({ error: String(e) }, 500);
     }
   });

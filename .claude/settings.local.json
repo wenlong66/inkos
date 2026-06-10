@@ -9,7 +9,8 @@
       "Bash(pnpm -v)",
       "Bash(npx pnpm *)",
       "Bash(node packages/cli/dist/index.js studio)",
-      "Bash(curl -fsS \"http://127.0.0.1:4567\")"
+      "Bash(curl -fsS \"http://127.0.0.1:4567\")",
+      "mcp__filesystem__read_text_file"
     ]
   }
 }

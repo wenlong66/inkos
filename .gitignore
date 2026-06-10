@@ -27,3 +27,5 @@ _*.md
 books/
 inkos.json
 prompt/
+*.log
+*.pid

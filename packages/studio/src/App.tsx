@@ -9,6 +9,7 @@ import { ChapterReader } from "./pages/ChapterReader";
 import { Analytics } from "./pages/Analytics";
 import { ServiceListPage } from "./pages/ServiceListPage";
 import { ServiceDetailPage } from "./pages/ServiceDetailPage";
+import { ProjectSettings } from "./pages/ProjectSettings";
 import { TruthFiles } from "./pages/TruthFiles";
 import { DaemonControl } from "./pages/DaemonControl";
 import { LogViewer } from "./pages/LogViewer";
@@ -74,13 +75,14 @@ export function App() {
       setRoute({ page: "chapter", bookId, chapterNumber }),
     toAnalytics: (bookId: string) => setRoute({ page: "analytics", bookId }),
     toServices: () => setRoute({ page: "services" }),
+    toProjectSettings: () => setRoute({ page: "project-settings" }),
     toServiceDetail: (id: string) => setRoute({ page: "service-detail", serviceId: id }),
     toTruth: (bookId: string) => setRoute({ page: "truth", bookId }),
     toDaemon: () => setRoute({ page: "daemon" }),
     toLogs: () => setRoute({ page: "logs" }),
     toGenres: () => setRoute({ page: "genres" }),
     toStyle: () => setRoute({ page: "style" }),
-    toImport: () => setRoute({ page: "import" }),
+    toImport: (tab?: "chapters" | "canon" | "fanfic" | "spinoff" | "imitation") => setRoute({ page: "import", ...(tab ? { tab } : {}) }),
     toRadar: () => setRoute({ page: "radar" }),
     toDoctor: () => setRoute({ page: "doctor" }),
   };
@@ -125,9 +127,9 @@ export function App() {
           <div className="flex items-center gap-2">
              <button
                onClick={nav.toDashboard}
-               className="inline-flex items-center gap-2 rounded-lg border border-border/50 bg-card/70 px-3 py-1.5 text-sm font-semibold text-foreground hover:bg-secondary/50 transition-colors"
+               className="inline-flex items-center gap-2 rounded-lg border border-border/50 bg-card/70 px-3.5 py-2 text-[17px] font-semibold text-foreground hover:bg-secondary/50 transition-colors"
              >
-               <House size={14} />
+               <House size={18} />
                <span>首页</span>
                <span className="text-muted-foreground/70">/</span>
                <span className="font-serif">InkOS Studio</span>
@@ -135,13 +137,13 @@ export function App() {
           </div>
 
           <div className="flex items-center gap-3">
-            <div className="flex gap-0.5 bg-muted/50 rounded-md p-0.5">
+            <div className="flex gap-0.5 bg-muted/50 rounded-lg p-0.5">
               <button
                 onClick={async () => {
                   await putApi("/project", { language: "zh" });
                   refetchProject();
                 }}
-                className={`text-xs px-2 py-0.5 rounded ${currentLang === "zh" ? "bg-primary text-primary-foreground" : "text-muted-foreground"}`}
+                className={`px-2.5 py-1 text-[16px] font-medium rounded-md ${currentLang === "zh" ? "bg-primary text-primary-foreground" : "text-muted-foreground"}`}
               >
                 中
               </button>
@@ -150,7 +152,7 @@ export function App() {
                   await putApi("/project", { language: "en" });
                   refetchProject();
                 }}
-                className={`text-xs px-2 py-0.5 rounded ${currentLang === "en" ? "bg-primary text-primary-foreground" : "text-muted-foreground"}`}
+                className={`px-2.5 py-1 text-[16px] font-medium rounded-md ${currentLang === "en" ? "bg-primary text-primary-foreground" : "text-muted-foreground"}`}
               >
                 EN
               </button>
@@ -160,7 +162,7 @@ export function App() {
               onClick={() => setTheme(isDark ? "light" : "dark")}
               className="text-muted-foreground hover:text-foreground transition-colors"
             >
-              {isDark ? <Sun size={14} /> : <Moon size={14} />}
+              {isDark ? <Sun size={18} /> : <Moon size={18} />}
             </button>
           </div>
         </header>
@@ -228,6 +230,11 @@ export function App() {
               <ServiceListPage nav={nav} />
             </div>
           )}
+          {route.page === "project-settings" && (
+            <div className="max-w-4xl mx-auto px-6 py-12 md:px-12 lg:py-16 fade-in">
+              <ProjectSettings nav={nav} theme={theme} t={t} />
+            </div>
+          )}
           {route.page === "service-detail" && (
             <div className="max-w-4xl mx-auto px-6 py-12 md:px-12 lg:py-16 fade-in">
               <ServiceDetailPage serviceId={route.serviceId} nav={nav} />
@@ -260,7 +267,7 @@ export function App() {
           )}
           {route.page === "import" && (
             <div className="max-w-4xl mx-auto px-6 py-12 md:px-12 lg:py-16 fade-in">
-              <ImportManager nav={nav} theme={theme} t={t} />
+              <ImportManager nav={nav} theme={theme} t={t} initialTab={route.tab} />
             </div>
           )}
           {route.page === "radar" && (

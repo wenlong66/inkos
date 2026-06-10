@@ -4,6 +4,7 @@ import type { TFunction } from "../hooks/use-i18n";
 import type { SSEMessage } from "../hooks/use-sse";
 import { fetchJson } from "../hooks/use-api";
 import { chatSelectors, useChatStore } from "../store/chat";
+import type { ChatSessionKind } from "../store/chat";
 import { useServiceStore } from "../store/service";
 import {
   DropdownMenu,
@@ -18,13 +19,18 @@ import {
 } from "../components/ai-elements/reasoning";
 import { ChatMessage } from "../components/chat/ChatMessage";
 import { QuickActions } from "../components/chat/QuickActions";
-import { ToolExecutionSteps } from "../components/chat/ToolExecutionSteps";
+import { ToolExecutionSteps, type ProposedActionDetails } from "../components/chat/ToolExecutionSteps";
+import { PlayHud } from "../components/chat/PlayHud";
+import { PlayChoicePanel } from "../components/chat/PlayChoicePanel";
+import { latestPlayChoiceSet } from "../components/chat/play-choices";
 import {
   Loader2,
   BotMessageSquare,
   ArrowUp,
   ChevronDown,
   Check,
+  Gamepad2,
+  Palette,
 } from "lucide-react";
 import { Shimmer } from "../components/ai-elements/shimmer";
 import {
@@ -40,6 +46,8 @@ import {
   pickModelSelection,
   setBookCreateSessionId,
   setProjectChatSessionId,
+  isChatScrollNearBottom,
+  shouldShowPlayChoicePanel,
 } from "./chat-page-state";
 
 // -- Types --
@@ -48,6 +56,8 @@ interface Nav {
   toDashboard: () => void;
   toBook: (id: string) => void;
   toServices: () => void;
+  toImport: (tab?: "chapters" | "canon" | "fanfic" | "spinoff" | "imitation") => void;
+  toStyle: () => void;
 }
 
 export interface ChatPageProps {
@@ -64,11 +74,28 @@ interface ServiceConfigPayload {
   readonly defaultModel?: string | null;
 }
 
+interface PlayImageSettings {
+  readonly actors: boolean;
+  readonly moments: boolean;
+  readonly inventory: boolean;
+}
+
+interface PlayRunImagePayload {
+  readonly imageSettings?: PlayImageSettings;
+}
+
+interface CoverConfigResponse {
+  readonly service?: string | null;
+  readonly configured?: boolean;
+  readonly providers?: ReadonlyArray<{ readonly service: string; readonly connected?: boolean }>;
+}
+
 // -- Component --
 
 export function ChatPage({ activeBookId, mode = activeBookId ? "book" : "book-create", nav, theme, t, sse: _sse }: ChatPageProps) {
   // -- Store selectors --
   const messages = useChatStore(chatSelectors.activeMessages);
+  const activeSession = useChatStore(chatSelectors.activeSession);
   const activeSessionId = useChatStore((s) => s.activeSessionId);
   const input = useChatStore((s) => s.input);
   const loading = useChatStore(chatSelectors.isActiveSessionStreaming);
@@ -80,14 +107,45 @@ export function ChatPage({ activeBookId, mode = activeBookId ? "book" : "book-cr
   const setSelectedModel = useChatStore((s) => s.setSelectedModel);
   const loadSessionList = useChatStore((s) => s.loadSessionList);
   const createSession = useChatStore((s) => s.createSession);
+  const markProposalResolved = useChatStore((s) => s.markProposalResolved);
   const loadSessionDetail = useChatStore((s) => s.loadSessionDetail);
   const activateSession = useChatStore((s) => s.activateSession);
+  const setSessionPlayMode = useChatStore((s) => s.setSessionPlayMode);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const autoScrollPinnedRef = useRef(true);
 
   const isZh = t("nav.connected") === "\u5DF2\u8FDE\u63A5";
   const hasBook = Boolean(activeBookId);
+  const currentSessionKind: ChatSessionKind = activeSession?.sessionKind
+    ?? (mode === "book-create" ? "book-create" : activeBookId ? "book" : "chat");
+  const playMode = activeSession?.playMode;
+  // A play session must pick its playstyle (点着玩 / 自由玩) before chatting.
+  const needsPlayModeChoice = currentSessionKind === "play" && !playMode;
+  // Even in 点着玩 the world is shaped by free typing first; the choice panel
+  // only replaces the input once play has actually started (a play tool
+  // produced choices).
+  const playChoiceSet = useMemo(
+    () => (currentSessionKind === "play" && playMode === "guided" ? latestPlayChoiceSet(messages) : null),
+    [currentSessionKind, playMode, messages],
+  );
+  const [consumedPlayChoiceKey, setConsumedPlayChoiceKey] = useState<string | null>(null);
+  const playChoices = playChoiceSet?.choices ?? [];
+  const showChoicePanel = shouldShowPlayChoicePanel({
+    playMode,
+    choiceSetKey: playChoiceSet?.key ?? null,
+    consumedChoiceKey: consumedPlayChoiceKey,
+    choiceCount: playChoices.length,
+  });
+  // World panel (holdings / state / relations) defaults collapsed; the scene
+  // image and choices live in the chat center now, opened on demand.
+  const [worldPanelOpen, setWorldPanelOpen] = useState(false);
+  const [playImageError, setPlayImageError] = useState<string | null>(null);
+  const [playImageMenuOpen, setPlayImageMenuOpen] = useState(false);
+  const [playImageSettings, setPlayImageSettings] = useState<PlayImageSettings>({ actors: false, moments: false, inventory: false });
+  const [playImageCoverReady, setPlayImageCoverReady] = useState(false);
+  const worldPanelInsetClass = currentSessionKind === "play" && worldPanelOpen ? "lg:pr-[380px]" : "";
 
   // Derived: is the assistant currently streaming/thinking/executing tools?
   const isStreaming = useMemo(() => {
@@ -186,18 +244,31 @@ export function ChatPage({ activeBookId, mode = activeBookId ? "book" : "book-cr
     el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
   }, [input]);
 
-  // Auto-scroll on new messages
+  // Auto-scroll only while the reader is already near the bottom. Play sessions
+  // update tool/image state frequently, so unconditional scrolling makes it
+  // impossible to read older turns.
   useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
-    }
+    if (!scrollRef.current || !autoScrollPinnedRef.current) return;
+    scrollRef.current.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
   }, [messages]);
+
+  useEffect(() => {
+    autoScrollPinnedRef.current = true;
+  }, [activeSessionId]);
 
   // Entering a book loads its latest session; book-create mode persists its orphan session in localStorage.
   useEffect(() => {
     let cancelled = false;
 
     void (async () => {
+      if (!activeBookId && mode === "project-chat") {
+        const state = useChatStore.getState();
+        const currentSession = state.activeSessionId ? state.sessions[state.activeSessionId] : null;
+        if (currentSession?.bookId === null && currentSession.isDraft) {
+          return;
+        }
+      }
+
       if (activeBookId) {
         await loadSessionList(activeBookId);
         if (cancelled) return;
@@ -215,7 +286,7 @@ export function ChatPage({ activeBookId, mode = activeBookId ? "book" : "book-cr
           return;
         }
 
-        await createSession(activeBookId);
+        await createSession(activeBookId, "book");
         return;
       }
 
@@ -247,7 +318,7 @@ export function ChatPage({ activeBookId, mode = activeBookId ? "book" : "book-cr
         }
       }
 
-      const newSessionId = await createSession(null);
+      const newSessionId = await createSession(null, mode === "book-create" ? "book-create" : "chat");
       if (!cancelled) {
         if (mode === "project-chat") {
           setProjectChatSessionId(newSessionId);
@@ -264,26 +335,176 @@ export function ChatPage({ activeBookId, mode = activeBookId ? "book" : "book-cr
 
   const onSend = (text: string) => {
     if (!activeSessionId) return;
-    void sendMessage(activeSessionId, text, activeBookId);
+    autoScrollPinnedRef.current = true;
+    void sendMessage(activeSessionId, text, {
+      activeBookId,
+      sessionKind: currentSessionKind,
+      actionSource: "free-text",
+    });
   };
 
-  const handleQuickAction = (command: string) => {
+  const handleQuickAction = (command: string, requestedIntent?: "write_next") => {
     if (!activeSessionId) return;
-    void sendMessage(activeSessionId, command, activeBookId);
+    autoScrollPinnedRef.current = true;
+    void sendMessage(activeSessionId, command, {
+      activeBookId,
+      sessionKind: currentSessionKind,
+      actionSource: "quick-action",
+      requestedIntent,
+    });
   };
 
-  const emptyGuidance = isZh
-    ? "\u544A\u8BC9\u6211\u4F60\u60F3\u5199\u4EC0\u4E48\u2014\u2014\u9898\u6750\u3001\u4E16\u754C\u89C2\u3001\u4E3B\u89D2\u3001\u6838\u5FC3\u51B2\u7A81"
-    : "Tell me what you want to write \u2014 genre, world, protagonist, core conflict";
+  const handleProposedAction = async (details: ProposedActionDetails) => {
+    // Lock the proposal card so the production action can't be re-fired.
+    markProposalResolved(details.execId, "confirmed");
+    const targetPlayMode = details.targetSessionKind === "play"
+      ? details.actionPayload?.playStart?.mode ?? activeSession?.playMode ?? (details.action === "play_start" ? "open" : undefined)
+      : undefined;
+    if (details.targetRoute) {
+      if (details.targetRoute === "import:fanfic") nav.toImport("fanfic");
+      else if (details.targetRoute === "import:chapters") nav.toImport("chapters");
+      else if (details.targetRoute === "import:canon") nav.toImport("canon");
+      else if (details.targetRoute === "import:spinoff") nav.toImport("spinoff");
+      else if (details.targetRoute === "import:imitation") nav.toImport("imitation");
+      else if (details.targetRoute === "style") nav.toStyle();
+      return;
+    }
+    if (details.sameSession && activeSessionId) {
+      autoScrollPinnedRef.current = true;
+      await sendMessage(activeSessionId, details.instruction ?? "", {
+        activeBookId,
+        sessionKind: details.targetSessionKind,
+        playMode: targetPlayMode,
+        actionSource: "button",
+        requestedIntent: details.action,
+        actionPayload: details.actionPayload,
+      });
+      return;
+    }
+    const targetSessionId = await createSession(null, details.targetSessionKind, targetPlayMode);
+    autoScrollPinnedRef.current = true;
+    await sendMessage(targetSessionId, details.instruction ?? "", {
+      sessionKind: details.targetSessionKind,
+      playMode: targetPlayMode,
+      actionSource: "button",
+      requestedIntent: details.action,
+      actionPayload: details.actionPayload,
+    });
+  };
+
+  const handleRejectProposedAction = async (details: ProposedActionDetails) => {
+    markProposalResolved(details.execId, "rejected");
+    if (!activeSessionId) return;
+    autoScrollPinnedRef.current = true;
+    await sendMessage(activeSessionId, `取消这次操作：${details.title ?? details.instruction}`, {
+      activeBookId,
+      sessionKind: currentSessionKind,
+      actionSource: "button",
+    });
+  };
+
+  useEffect(() => { setPlayImageError(null); }, [activeSessionId]);
+
+  useEffect(() => {
+    if (!activeSessionId || currentSessionKind !== "play") return;
+    let cancelled = false;
+    void fetchJson<PlayRunImagePayload>(`/play/runs/${encodeURIComponent(activeSessionId)}/main`)
+      .then((payload) => {
+        if (!cancelled && payload.imageSettings) setPlayImageSettings(payload.imageSettings);
+      })
+      .catch(() => {
+        // No persisted play world yet.
+      });
+    void fetchJson<CoverConfigResponse>("/cover/config")
+      .then((cfg) => {
+        if (cancelled) return;
+        const selected = cfg.service ?? null;
+        setPlayImageCoverReady(
+          cfg.configured ?? (!!selected && (cfg.providers ?? []).some((p) => p.service === selected && p.connected)),
+        );
+      })
+      .catch(() => {
+        if (!cancelled) setPlayImageCoverReady(false);
+      });
+    return () => { cancelled = true; };
+  }, [activeSessionId, currentSessionKind]);
+
+  const togglePlayImageSetting = async (key: keyof PlayImageSettings) => {
+    if (!activeSessionId || currentSessionKind !== "play" || !playImageCoverReady) return;
+    const next = { ...playImageSettings, [key]: !playImageSettings[key] };
+    setPlayImageSettings(next);
+    setPlayImageError(null);
+    try {
+      await fetchJson(`/play/runs/${encodeURIComponent(activeSessionId)}/main/image-settings`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(next),
+      });
+    } catch (error) {
+      setPlayImageSettings(playImageSettings);
+      setPlayImageError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const emptyGuidance = (() => {
+    if (currentSessionKind === "short") {
+      return isZh
+        ? "说一个短篇方向、标题灵感、人物压力或核心冲突，我会走 InkOS Short 生成正文、简介和封面。"
+        : "Describe a short-fiction direction, title hook, pressure, or core conflict to run InkOS Short.";
+    }
+    if (currentSessionKind === "play") {
+      return isZh
+        ? "说一个可玩的世界、角色处境或开场动作，我会启动互动世界；之后你可以自由行动或点建议动作。"
+        : "Describe a playable world, character situation, or opening action to start an interactive world.";
+    }
+    return isZh
+      ? "\u544A\u8BC9\u6211\u4F60\u60F3\u5199\u4EC0\u4E48\u2014\u2014\u9898\u6750\u3001\u4E16\u754C\u89C2\u3001\u4E3B\u89D2\u3001\u6838\u5FC3\u51B2\u7A81"
+      : "Tell me what you want to write \u2014 genre, world, protagonist, core conflict";
+  })();
 
   return (
-    <div className="flex flex-col h-full flex-1 min-w-0">
+    <div className="flex flex-col h-full flex-1 min-w-0 relative">
       {/* Message scroll area */}
       <div
         ref={scrollRef}
-        className="chat-message-scroll flex-1 overflow-y-auto [scrollbar-gutter:stable] px-4 py-6"
+        onScroll={(event) => {
+          const target = event.currentTarget;
+          autoScrollPinnedRef.current = isChatScrollNearBottom({
+            scrollTop: target.scrollTop,
+            clientHeight: target.clientHeight,
+            scrollHeight: target.scrollHeight,
+          });
+        }}
+        className={`chat-message-scroll flex-1 overflow-y-auto [scrollbar-gutter:stable] px-4 py-6 transition-[padding] duration-200 ${worldPanelInsetClass}`}
       >
-        {messages.length === 0 && !loading ? (
+        {needsPlayModeChoice ? (
+          <div className="h-full flex flex-col items-center justify-center text-center select-none gap-4">
+            <div className="w-14 h-14 rounded-2xl border border-dashed border-border flex items-center justify-center bg-secondary/30 opacity-40">
+              <Gamepad2 size={24} className="text-muted-foreground" />
+            </div>
+            <p className="text-sm text-muted-foreground/70 max-w-md leading-7">
+              {isZh ? "选个玩法，进去再聊你想玩的世界。" : "Pick a playstyle, then describe the world you want in chat."}
+            </p>
+            <div className="flex gap-3">
+              <button
+                type="button"
+                onClick={() => { if (activeSessionId) setSessionPlayMode(activeSessionId, "guided"); }}
+                className="w-40 rounded-xl border border-border/50 bg-secondary/30 px-4 py-3 text-left transition-all hover:border-primary/40 hover:bg-primary/5"
+              >
+                <div className="text-sm font-medium text-foreground">{isZh ? "点着玩" : "Choices"}</div>
+                <div className="mt-1 text-xs leading-5 text-muted-foreground">{isZh ? "GM 给选项，点着推进" : "Pick from offered actions"}</div>
+              </button>
+              <button
+                type="button"
+                onClick={() => { if (activeSessionId) setSessionPlayMode(activeSessionId, "open"); }}
+                className="w-40 rounded-xl border border-border/50 bg-secondary/30 px-4 py-3 text-left transition-all hover:border-primary/40 hover:bg-primary/5"
+              >
+                <div className="text-sm font-medium text-foreground">{isZh ? "自由玩" : "Free"}</div>
+                <div className="mt-1 text-xs leading-5 text-muted-foreground">{isZh ? "自己打字，想干嘛干嘛" : "Type anything you want"}</div>
+              </button>
+            </div>
+          </div>
+        ) : messages.length === 0 && !loading ? (
           <div className="h-full flex flex-col items-center justify-center text-center select-none">
             <div className="w-14 h-14 rounded-2xl border border-dashed border-border flex items-center justify-center mb-4 bg-secondary/30 opacity-40">
               <BotMessageSquare size={24} className="text-muted-foreground" />
@@ -339,7 +560,14 @@ export function ChatPage({ activeBookId, mode = activeBookId ? "book" : "book-cr
                           );
                         }
                         if (item.kind === "tools") {
-                          return <ToolExecutionSteps key={`x-${item.startIdx}`} executions={item.parts.map(p => p.execution)} />;
+                          return (
+                            <ToolExecutionSteps
+                              key={`x-${item.startIdx}`}
+                              executions={item.parts.map(p => p.execution)}
+                              onProposedAction={handleProposedAction}
+                              onRejectProposedAction={handleRejectProposedAction}
+                            />
+                          );
                         }
                         if (item.kind === "text" && item.part.content) {
                           return (
@@ -384,20 +612,41 @@ export function ChatPage({ activeBookId, mode = activeBookId ? "book" : "book-cr
       </div>
 
       {/* Quick actions (only when a book is active) */}
-      {hasBook && (
-        <div className="shrink-0 max-w-3xl mx-auto w-full px-4">
-          <QuickActions
-            onAction={handleQuickAction}
-            disabled={loading || !activeSessionId}
-            isZh={isZh}
-          />
+      {hasBook && !showChoicePanel && (
+        <div className={`shrink-0 transition-[padding] duration-200 ${worldPanelInsetClass}`}>
+          <div className="max-w-3xl mx-auto w-full px-4">
+            <QuickActions
+              onAction={handleQuickAction}
+              disabled={loading || !activeSessionId}
+              isZh={isZh}
+            />
+          </div>
         </div>
       )}
 
-      {/* Input area */}
-      <div className="shrink-0 border-t border-border/40 px-4 py-3">
+      {/* Play choices are shortcuts, not a replacement for free actions. Scene
+          images render inside their corresponding chat result card so the
+          visual history scrolls with the conversation. */}
+      {currentSessionKind === "play" && !needsPlayModeChoice && showChoicePanel && (
+        <div className={`shrink-0 transition-[padding] duration-200 ${worldPanelInsetClass}`}>
+          <PlayChoicePanel
+            choices={playChoices}
+            disabled={loading || !activeSessionId}
+            isZh={isZh}
+            onChoose={(action) => {
+              if (!activeSessionId || !playChoiceSet) return;
+              setConsumedPlayChoiceKey(playChoiceSet.key);
+              autoScrollPinnedRef.current = true;
+              void sendMessage(activeSessionId, action, { activeBookId, sessionKind: "play", actionSource: "button" });
+            }}
+          />
+        </div>
+      )}
+      {needsPlayModeChoice ? null : (
+      <div className={`shrink-0 border-t border-border/40 px-4 py-3 transition-[padding] duration-200 ${worldPanelInsetClass}`}>
         <div className="max-w-3xl mx-auto">
-            <div className="rounded-xl bg-secondary/30 transition-all">
+          <div className="flex items-start gap-2">
+            <div className="flex-1 rounded-xl bg-secondary/30 transition-all">
               <div className="flex items-center gap-2 px-3 py-2">
                 <textarea
                   ref={textareaRef}
@@ -407,7 +656,7 @@ export function ChatPage({ activeBookId, mode = activeBookId ? "book" : "book-cr
                   placeholder={isZh ? "输入指令..." : "Enter command..."}
                   disabled={loading || !activeSessionId}
                   rows={1}
-                  className="flex-1 bg-transparent text-sm leading-6 placeholder:text-muted-foreground/50 outline-none! border-none! ring-0! shadow-none focus:outline-none! focus:ring-0! focus:border-none! resize-none disabled:opacity-50 max-h-[200px] overflow-y-auto"
+                  className="flex-1 bg-transparent text-base leading-7 placeholder:text-muted-foreground/50 outline-none! border-none! ring-0! shadow-none focus:outline-none! focus:ring-0! focus:border-none! resize-none disabled:opacity-50 max-h-[200px] overflow-y-auto"
                 />
                 <button
                   type="button"
@@ -420,14 +669,14 @@ export function ChatPage({ activeBookId, mode = activeBookId ? "book" : "book-cr
               </div>
               <div className="flex items-center gap-2 px-3 pb-2 border-t border-border/20 pt-1.5">
                 {modelPickerStatus === "loading" ? (
-                  <span className="text-xs text-muted-foreground/40 animate-pulse">加载模型...</span>
+                  <span className="text-[15px] text-muted-foreground/40 animate-pulse">加载模型...</span>
                 ) : modelPickerStatus === "ready" ? (
                   <DropdownMenu>
-                    <DropdownMenuTrigger className="flex items-center gap-1.5 px-2 py-1 rounded-md hover:bg-muted text-sm transition-colors cursor-pointer">
-                      <span className="font-medium text-xs truncate max-w-[220px]">
+                    <DropdownMenuTrigger className="flex items-center gap-1.5 px-2 py-1.5 rounded-md hover:bg-muted text-[16px] transition-colors cursor-pointer">
+                      <span className="font-medium truncate max-w-[260px]">
                         {selectedModelLabel}
                       </span>
-                      <ChevronDown size={14} className="text-muted-foreground" />
+                      <ChevronDown size={17} className="text-muted-foreground" />
                     </DropdownMenuTrigger>
                     <ModelPickerContent
                       groupedModels={groupedModels}
@@ -440,15 +689,91 @@ export function ChatPage({ activeBookId, mode = activeBookId ? "book" : "book-cr
                 ) : (
                   <button
                     onClick={() => nav.toServices()}
-                    className="text-xs text-muted-foreground/50 hover:text-primary transition-colors"
+                    className="text-[15px] text-muted-foreground/50 hover:text-primary transition-colors"
                   >
                     配置模型 →
                   </button>
                 )}
+                {currentSessionKind === "play" && (
+                  <button
+                    type="button"
+                    onClick={() => setWorldPanelOpen((v) => !v)}
+                    className={`ml-auto flex items-center gap-1.5 rounded-md px-3 py-1.5 text-[16px] font-medium transition-colors ${worldPanelOpen ? "bg-primary/15 text-primary" : "text-muted-foreground hover:bg-muted hover:text-primary"}`}
+                    title={isZh ? "查看世界：持有 / 状态 / 关系" : "View world: holdings / state / relations"}
+                  >
+                    <Gamepad2 size={18} />
+                    {isZh ? "查看世界" : "View World"}
+                  </button>
+                )}
               </div>
             </div>
+            {currentSessionKind === "play" ? (
+              <div className="relative mt-1 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setPlayImageMenuOpen((value) => !value)}
+                  disabled={loading || !activeSessionId}
+                  title={isZh ? "自动配图" : "Auto illustration"}
+                  className={`flex h-10 w-10 items-center justify-center rounded-xl border border-border/50 bg-secondary/40 shadow-sm transition-all hover:border-primary/50 hover:bg-primary/10 hover:text-primary active:scale-95 disabled:cursor-not-allowed disabled:opacity-30 ${playImageMenuOpen || playImageSettings.actors || playImageSettings.moments || playImageSettings.inventory ? "text-primary" : "text-muted-foreground"}`}
+                  aria-label={isZh ? "自动配图" : "Auto illustration"}
+                >
+                  <Palette size={17} />
+                </button>
+                {playImageMenuOpen ? (
+                  <div className="absolute bottom-12 right-0 z-30 w-44 rounded-xl border border-border/50 bg-card/95 p-2 shadow-xl backdrop-blur">
+                    <div className="mb-1.5 px-1 text-[12px] leading-5 font-semibold uppercase tracking-wider text-muted-foreground/60">
+                      {isZh ? "自动配图" : "Auto illustration"}
+                    </div>
+                    {(["actors", "moments", "inventory"] as const).map((key) => (
+                      <label
+                        key={key}
+                        className={`flex items-center gap-2 rounded-lg px-2 py-1.5 text-[14px] leading-6 ${playImageCoverReady ? "cursor-pointer text-foreground hover:bg-secondary/50" : "cursor-not-allowed text-muted-foreground/40"}`}
+                        title={playImageCoverReady ? undefined : (isZh ? "先在「模型配置」里配好生图 API 才能开启" : "Configure an image API in Model Settings first")}
+                      >
+                        <input
+                          type="checkbox"
+                          disabled={!playImageCoverReady}
+                          checked={playImageCoverReady && playImageSettings[key]}
+                          onChange={() => void togglePlayImageSetting(key)}
+                          className="h-4 w-4 accent-primary"
+                        />
+                        {key === "actors"
+                          ? (isZh ? "为角色配图" : "Characters")
+                          : key === "moments"
+                            ? (isZh ? "为时刻配图" : "Moments")
+                            : (isZh ? "为背包配图" : "Inventory")}
+                      </label>
+                    ))}
+                    {!playImageCoverReady ? (
+                      <p className="mt-1 px-1 text-[12px] leading-5 text-muted-foreground/50">
+                        {isZh ? "未检测到生图 API。" : "No image API configured."}
+                      </p>
+                    ) : null}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
+          {playImageError ? (
+            <p className="mt-2 text-right text-[13px] leading-5 text-destructive/80">
+              {isZh ? `配图失败：${playImageError}` : `Image failed: ${playImageError}`}
+            </p>
+          ) : null}
         </div>
       </div>
+      )}
+
+      {currentSessionKind === "play" && activeSessionId && (
+        <PlayHud
+          sessionId={activeSessionId}
+          isStreaming={loading}
+          isZh={isZh}
+          open={worldPanelOpen}
+          onClose={() => setWorldPanelOpen(false)}
+          imageSettings={playImageSettings}
+          sessionTitle={activeSession?.title ?? null}
+        />
+      )}
     </div>
   );
 }

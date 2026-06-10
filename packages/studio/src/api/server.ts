@@ -22,10 +22,10 @@ import {
   migrateBookSession,
   SessionAlreadyMigratedError,
   runAgentSession,
-  buildAgentSystemPrompt,
   resolveServicePreset,
   resolveServiceProviderFamily,
   resolveServiceModelsBaseUrl,
+  guessServiceFromBaseUrl,
   resolveServiceModel,
   loadSecrets,
   saveSecrets,
@@ -36,16 +36,47 @@ import {
   fetchWithProxy,
   chatCompletion,
   buildExportArtifact,
+  evaluateBookQuality,
+  ConsolidatorAgent,
+  DetectionConfigSchema,
+  InputGovernanceModeSchema,
   GLOBAL_ENV_PATH,
   COVER_PROVIDER_PRESETS,
+  createPlayDB,
+  PlayStore,
+  buildPlayEntityImagePrompt,
+  buildPlaySceneImagePrompt,
+  generatePlayImage,
+  readPlayImageManifest,
+  readPlayImageSettings,
+  writePlayImageSettings,
+  type PlayImageSettings,
   Scheduler,
   coverSecretKey,
   resolveCoverProviderPreset,
+  SessionKindSchema,
+  isExplicitWriteChapterCommand,
+  isUsablePlayInitialScene,
+  isWriteNextInstruction,
+  normalizeActionSource as normalizeCoreActionSource,
+  normalizeActionPayload as normalizeCoreActionPayload,
+  normalizePlayMode as normalizeCorePlayMode,
+  normalizeRequestedIntent as normalizeCoreRequestedIntent,
+  inferLanguage,
+  type ActionPayload,
+  type ActionSource,
+  createGenerateCoverTool,
+  createPlayStartTool,
+  createShortFictionRunTool,
+  createSubAgentTool,
   type ResolvedModel,
   type PipelineConfig,
+  type PlayMode,
   type ProjectConfig,
   type LogSink,
   type LogEntry,
+  type RequestedIntent,
+  type SessionKind,
 } from "@actalk/inkos-core";
 import { access, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
@@ -78,8 +109,13 @@ const AGENT_LABELS: Record<string, string> = {
 };
 const TOOL_LABELS: Record<string, string> = {
   read: "读取文件", edit: "编辑文件", grep: "搜索", ls: "列目录",
+  propose_action: "确认动作",
   short_fiction_run: "短篇生产",
   generate_cover: "生成封面",
+  play_edit: "编辑互动世界",
+  play_start: "启动互动世界",
+  play_revise: "重做互动回合",
+  play_step: "推进互动世界",
 };
 
 function resolveToolLabel(tool: string, agent?: string): string {
@@ -128,6 +164,9 @@ const NON_TEXT_MODEL_ID_PARTS = [
 
 const SERVICE_MODELS_PROBE_TIMEOUT_MS = 4_000;
 const SERVICE_CHAT_PROBE_TIMEOUT_MS = 8_000;
+// Hard ceiling for the whole /doctor connectivity probe (models + chat fallback
+// loop) so the diagnostics page never spins on a slow/rate-limited upstream.
+const DOCTOR_LLM_PROBE_BUDGET_MS = 9_000;
 const MAX_DISCOVERED_MODELS_TO_PING = 2;
 const MAX_GENERIC_FALLBACK_MODELS_TO_PING = 2;
 
@@ -231,10 +270,74 @@ function hasSuccessfulSubAgentExec(
   );
 }
 
-function isWriteNextInstruction(instruction: string): boolean {
-  const trimmed = instruction.trim();
-  return /^(continue|继续|继续写|写下一章|write next|下一章|再来一章)$/i.test(trimmed)
-    || /(继续写|写下一章|下一章|再来一章|write\s+next)/i.test(trimmed);
+function hasSuccessfulToolExec(
+  execs: ReadonlyArray<CollectedToolExec>,
+  tool: string,
+): boolean {
+  return execs.some((exec) =>
+    exec.tool === tool
+    && exec.status === "completed"
+    && !isLikelyFailedToolResult(exec)
+  );
+}
+
+function hasSuccessfulToolResult(execs: ReadonlyArray<CollectedToolExec>): boolean {
+  return execs.some((exec) => exec.status === "completed" && !isLikelyFailedToolResult(exec));
+}
+
+function normalizeStudioSessionKind(value: unknown, fallback: SessionKind): SessionKind {
+  if (value === undefined || value === null || value === "") return fallback;
+  const parsed = SessionKindSchema.safeParse(value);
+  if (!parsed.success) {
+    throw new ApiError(400, "INVALID_SESSION_KIND", `Invalid sessionKind: ${String(value)}`);
+  }
+  return parsed.data;
+}
+
+function normalizeStudioActionSource(value: unknown): ActionSource {
+  try {
+    return normalizeCoreActionSource(value);
+  } catch {
+    throw new ApiError(400, "INVALID_ACTION_SOURCE", `Invalid actionSource: ${String(value)}`);
+  }
+}
+
+function normalizeStudioRequestedIntent(value: unknown): RequestedIntent | undefined {
+  try {
+    return normalizeCoreRequestedIntent(value);
+  } catch {
+    throw new ApiError(400, "INVALID_REQUESTED_INTENT", `Invalid requestedIntent: ${String(value)}`);
+  }
+}
+
+function normalizeStudioActionPayload(value: unknown): ActionPayload | undefined {
+  try {
+    return normalizeCoreActionPayload(value);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new ApiError(400, "INVALID_ACTION_PAYLOAD", `Invalid actionPayload: ${message}`);
+  }
+}
+
+function normalizeStudioPlayMode(value: unknown): PlayMode | undefined {
+  try {
+    return normalizeCorePlayMode(value);
+  } catch {
+    throw new ApiError(400, "INVALID_PLAY_MODE", `Invalid playMode: ${String(value)}`);
+  }
+}
+
+function shouldRunDirectWriteNext(args: {
+  readonly instruction: string;
+  readonly agentBookId: string | null | undefined;
+  readonly sessionKind: SessionKind;
+  readonly actionSource: ActionSource;
+  readonly requestedIntent?: RequestedIntent;
+}): boolean {
+  if (!args.agentBookId || args.sessionKind !== "book") return false;
+  if (args.requestedIntent === "write_next") return true;
+  if (args.actionSource === "free-text") return isExplicitWriteChapterCommand(args.instruction);
+  return isWriteNextInstruction(args.instruction);
 }
 
 type ExternalChatEditResult = {
@@ -260,6 +363,18 @@ function parseReplacementInstruction(instruction: string): { oldText: string; ne
     return { oldText: plain[1], newText: plain[2].trim() };
   }
   return null;
+}
+
+function isExplicitExternalChatEditInstruction(instruction: string): boolean {
+  const trimmed = instruction.trim();
+  if (!trimmed) return false;
+  if (/[?？]\s*$/.test(trimmed)) return false;
+  if (/^(?:请问|能否|能不能|可以|可不可以|是否|是不是|怎么|怎样|为什么|如果|假如|要不要|建议|讨论)\b/u.test(trimmed)) {
+    return false;
+  }
+
+  const imperative = trimmed.replace(/^(?:请|麻烦|帮我|直接|现在)\s*/u, "");
+  return /^(?:第\s*\d{1,4}\s*章\s*)?(?:把|将)\s*/u.test(imperative);
 }
 
 function parseChapterNumberForEdit(instruction: string): number | null {
@@ -366,6 +481,7 @@ async function tryHandleExternalChatEdit(params: {
 }): Promise<ExternalChatEditResult | null> {
   const replacement = parseReplacementInstruction(params.instruction);
   if (!replacement) return null;
+  if (!isExplicitExternalChatEditInstruction(params.instruction)) return null;
 
   const explicitPath = parseExplicitEditPath(params.instruction);
   if (explicitPath) {
@@ -437,15 +553,10 @@ async function tryHandleExternalChatEdit(params: {
   };
 }
 
-function looksLikeBookCreatedClaim(responseText: string): boolean {
-  return /(?:已|已经|成功).{0,12}(?:创建|建书|初始化|保存).{0,12}(?:作品|书|书籍|文件夹)?/.test(responseText)
-    || /\b(?:created|initiali[sz]ed|saved)\b.{0,40}\b(?:book|project|novel)\b/i.test(responseText);
-}
-
 function validateAgentActionExecution(args: {
   readonly instruction: string;
   readonly agentBookId: string | null | undefined;
-  readonly responseText: string;
+  readonly requestedIntent?: RequestedIntent;
   readonly collectedToolExecs: ReadonlyArray<CollectedToolExec>;
 }): string | undefined {
   const failedExec = args.collectedToolExecs.find(isLikelyFailedToolResult);
@@ -455,7 +566,7 @@ function validateAgentActionExecution(args: {
 
   if (
     args.agentBookId
-    && isWriteNextInstruction(args.instruction)
+    && args.requestedIntent === "write_next"
     && !hasSuccessfulSubAgentExec(args.collectedToolExecs, "writer")
   ) {
     return "模型声称已完成下一章，但没有实际调用写作工具。请重试；如果仍失败，请检查模型是否支持工具调用。";
@@ -463,13 +574,54 @@ function validateAgentActionExecution(args: {
 
   if (
     !args.agentBookId
-    && looksLikeBookCreatedClaim(args.responseText)
-    && !resolveCreatedBookIdFromToolExecs(args.collectedToolExecs)
+    && args.requestedIntent === "create_book"
+    && !hasSuccessfulSubAgentExec(args.collectedToolExecs, "architect")
   ) {
-    return "模型声称已创建作品，但没有实际调用建书工具，也没有生成作品文件。请补充书名/题材后重试，或换用支持工具调用的模型。";
+    return "已确认建书，但模型没有实际调用建书工具。请重试；如果仍失败，请检查模型是否支持工具调用。";
+  }
+
+  if (args.requestedIntent === "short_run" && !hasSuccessfulToolExec(args.collectedToolExecs, "short_fiction_run")) {
+    return "已确认生成短篇，但模型没有实际调用短篇生产工具。请重试；如果仍失败，请检查模型是否支持工具调用。";
+  }
+
+  if (args.requestedIntent === "play_start" && !hasSuccessfulToolExec(args.collectedToolExecs, "play_start")) {
+    return "已确认启动互动世界，但模型没有实际调用互动世界工具。请重试；如果仍失败，请检查模型是否支持工具调用。";
+  }
+
+  if (args.requestedIntent === "generate_cover" && !hasSuccessfulToolExec(args.collectedToolExecs, "generate_cover")) {
+    return "已确认生成封面，但模型没有实际调用封面工具。请重试；如果仍失败，请检查模型是否支持工具调用。";
   }
 
   return undefined;
+}
+
+type AgentFailureKind = "llm" | "internal" | "unknown";
+
+function classifyAgentFailure(message: string): AgentFailureKind {
+  const text = message.trim();
+  if (!text) return "unknown";
+  if (
+    /API\s*返回|上游|upstream|Bad Gateway|temporarily unavailable|rate limit|quota|API Key|unauthorized|forbidden|无法连接到 API|fetch failed|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|LLM returned empty response|Provider finish_reason|reasoning_content/i.test(text)
+  ) {
+    return "llm";
+  }
+  if (
+    /PlannerParseError|Architect output missing|required sections|missing YAML frontmatter|frontmatter delimiters|parseMemo|Book creation artifact is incomplete|Short-hit draft is incomplete|工具执行失败|执行失败|sub_agent|tool execution|RUNTIME_STATE_DELTA|JSON parse|解析失败/i.test(text)
+  ) {
+    return "internal";
+  }
+  return "unknown";
+}
+
+function formatAgentFailure(message: string): { readonly code: string; readonly message: string; readonly status: 500 | 502 } {
+  const kind = classifyAgentFailure(message);
+  if (kind === "llm") {
+    return { code: "AGENT_LLM_ERROR", message, status: 502 };
+  }
+  if (kind === "internal") {
+    return { code: "AGENT_INTERNAL_ERROR", message: `InkOS 内部流程错误：${message}`, status: 500 };
+  }
+  return { code: "AGENT_ERROR", message, status: 500 };
 }
 
 interface CollectedToolExec {
@@ -485,6 +637,236 @@ interface CollectedToolExec {
   stages?: Array<{ label: string; status: "pending" | "completed" }>;
   startedAt: number;
   completedAt?: number;
+}
+
+class ConfirmedActionExecutionError extends Error {
+  readonly exec: CollectedToolExec;
+
+  constructor(message: string, exec: CollectedToolExec, cause?: unknown) {
+    super(message);
+    this.name = "ConfirmedActionExecutionError";
+    this.exec = exec;
+    if (cause !== undefined) {
+      (this as { cause?: unknown }).cause = cause;
+    }
+  }
+}
+
+function suppressManualTextForTool(exec: CollectedToolExec): boolean {
+  return exec.tool === "play_start" || exec.tool === "play_step" || exec.tool === "play_revise";
+}
+
+function manualToolAssistantMessage(
+  responseText: string,
+  exec: CollectedToolExec,
+  provider: string,
+  model: string,
+): any {
+  return {
+    role: "assistant",
+    content: [{ type: "text", text: suppressManualTextForTool(exec) ? "" : responseText }],
+    api: "anthropic-messages",
+    provider,
+    model,
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "toolUse",
+    timestamp: Date.now(),
+  };
+}
+
+function manualToolAppendOptions(sessionKind: SessionKind, exec: CollectedToolExec): {
+  readonly sessionKind: SessionKind;
+  readonly legacyDisplay: { readonly toolExecutions: readonly CollectedToolExec[] };
+} {
+  return {
+    sessionKind,
+    legacyDisplay: { toolExecutions: [exec] },
+  };
+}
+
+function isConfirmedProductionAction(args: {
+  readonly actionSource: ActionSource;
+  readonly requestedIntent?: RequestedIntent;
+}): boolean {
+  return (args.actionSource === "button" || args.actionSource === "slash")
+    && (
+      args.requestedIntent === "create_book"
+      || args.requestedIntent === "short_run"
+      || args.requestedIntent === "play_start"
+      || args.requestedIntent === "generate_cover"
+    );
+}
+
+function requirePayloadText(value: string | undefined, message: string): string {
+  const text = value?.trim();
+  if (!text) {
+    throw new ApiError(400, "CONFIRMED_ACTION_PAYLOAD_INCOMPLETE", message);
+  }
+  return text;
+}
+
+function toolResultText(result: unknown): string {
+  const text = extractToolError(result).trim();
+  return text || "已完成。";
+}
+
+async function executeConfirmedProductionAction(args: {
+  readonly pipeline: PipelineRunner;
+  readonly root: string;
+  readonly sessionId: string;
+  readonly streamSessionId: string;
+  readonly instruction: string;
+  readonly requestedIntent: RequestedIntent;
+  readonly actionPayload?: ActionPayload;
+  readonly playMode?: PlayMode;
+}): Promise<CollectedToolExec> {
+  const id = `direct-${args.requestedIntent}-${Date.now().toString(36)}`;
+  const actionPayload = args.actionPayload;
+  let tool: ReturnType<typeof createSubAgentTool>
+    | ReturnType<typeof createShortFictionRunTool>
+    | ReturnType<typeof createGenerateCoverTool>
+    | ReturnType<typeof createPlayStartTool>;
+  let params: Record<string, unknown>;
+  let agent: string | undefined;
+
+  if (args.requestedIntent === "create_book") {
+    const payload = actionPayload?.createBook;
+    const title = requirePayloadText(payload?.title, "确认建书缺少书名，请重新生成确认卡。");
+    tool = createSubAgentTool(args.pipeline, null, args.root, { actionPayload });
+    agent = "architect";
+    params = {
+      agent,
+      instruction: args.instruction,
+      title,
+      ...(payload?.genre ? { genre: payload.genre } : {}),
+      ...(payload?.platform ? { platform: payload.platform } : {}),
+      ...(payload?.language ? { language: payload.language } : {}),
+      ...(payload?.targetChapters ? { targetChapters: payload.targetChapters } : {}),
+      ...(payload?.chapterWordCount ? { chapterWordCount: payload.chapterWordCount } : {}),
+    };
+  } else if (args.requestedIntent === "short_run") {
+    const payload = actionPayload?.shortRun;
+    const direction = payload?.direction?.trim() || args.instruction.trim();
+    if (!direction) throw new ApiError(400, "CONFIRMED_ACTION_PAYLOAD_INCOMPLETE", "确认短篇缺少方向，请重新生成确认卡。");
+    tool = createShortFictionRunTool(args.pipeline, args.root, { actionPayload });
+    params = {
+      direction,
+      ...(payload?.reference ? { reference: payload.reference } : {}),
+      ...(payload?.storyId ? { storyId: payload.storyId } : {}),
+      ...(payload?.chapters ? { chapters: payload.chapters } : {}),
+      ...(payload?.charsPerChapter ? { charsPerChapter: payload.charsPerChapter } : {}),
+      ...(payload?.cover !== undefined ? { cover: payload.cover } : {}),
+    };
+  } else if (args.requestedIntent === "generate_cover") {
+    const payload = actionPayload?.generateCover;
+    const title = requirePayloadText(payload?.title, "确认生成封面缺少标题，请重新生成确认卡。");
+    tool = createGenerateCoverTool(args.root, { actionPayload });
+    params = {
+      title,
+      ...(payload?.intro ? { intro: payload.intro } : {}),
+      ...(payload?.sellingPoints ? { sellingPoints: payload.sellingPoints } : {}),
+      ...(payload?.coverPrompt ? { coverPrompt: payload.coverPrompt } : {}),
+      ...(payload?.outputDir ? { outputDir: payload.outputDir } : {}),
+    };
+  } else if (args.requestedIntent === "play_start") {
+    const payload = actionPayload?.playStart;
+    const title = requirePayloadText(payload?.title, "确认启动互动世界缺少标题，请重新生成确认卡。");
+    const fallbackScene = [payload?.premise, args.instruction].filter((part): part is string => typeof part === "string" && part.trim().length > 0).join("\n\n");
+    const initialScene = isUsablePlayInitialScene(payload?.initialScene)
+      ? payload?.initialScene?.trim()
+      : fallbackScene.trim();
+    const confirmedActionPayload: ActionPayload | undefined = actionPayload
+      ? {
+        ...actionPayload,
+        playStart: {
+          ...payload,
+          title,
+          ...(initialScene ? { initialScene } : {}),
+        },
+      }
+      : undefined;
+    tool = createPlayStartTool(args.pipeline, args.root, args.sessionId, args.playMode, { actionPayload: confirmedActionPayload });
+    params = {
+      title,
+      ...(payload?.premise ? { premise: payload.premise } : {}),
+      ...(payload?.worldContract ? { worldContract: payload.worldContract } : {}),
+      ...(payload?.visualContract ? { visualContract: payload.visualContract } : {}),
+      ...(payload?.mode ? { mode: payload.mode } : {}),
+      ...(initialScene ? { initialScene } : {}),
+      ...(payload?.suggestedActions ? { suggestedActions: payload.suggestedActions } : {}),
+    };
+  } else {
+    throw new ApiError(400, "UNSUPPORTED_CONFIRMED_ACTION", `Unsupported confirmed action: ${args.requestedIntent}`);
+  }
+
+  const exec: CollectedToolExec = {
+    id,
+    tool: tool.name,
+    agent,
+    label: resolveToolLabel(tool.name, agent),
+    status: "running",
+    args: params,
+    stages: agent ? PIPELINE_STAGES[agent]?.map(label => ({ label, status: "pending" as const })) : undefined,
+    startedAt: Date.now(),
+  };
+
+  broadcast("tool:start", {
+    sessionId: args.streamSessionId,
+    id,
+    tool: tool.name,
+    args: params,
+    stages: exec.stages?.map(stage => stage.label),
+  });
+
+  try {
+    const result = await tool.execute(
+      id,
+      params as never,
+      undefined,
+      (partialResult) => {
+        broadcast("tool:update", {
+          sessionId: args.streamSessionId,
+          tool: tool.name,
+          partialResult,
+        });
+      },
+    );
+    exec.status = "completed";
+    exec.completedAt = Date.now();
+    exec.result = toolResultText(result);
+    exec.details = (result as { details?: unknown } | undefined)?.details;
+    exec.stages = exec.stages?.map(stage => ({ ...stage, status: "completed" as const }));
+    broadcast("tool:end", {
+      sessionId: args.streamSessionId,
+      id,
+      tool: tool.name,
+      result,
+      details: exec.details,
+      isError: false,
+    });
+    return exec;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const result = { content: [{ type: "text", text: message }] };
+    exec.status = "error";
+    exec.completedAt = Date.now();
+    exec.error = message;
+    broadcast("tool:end", {
+      sessionId: args.streamSessionId,
+      id,
+      tool: tool.name,
+      result,
+      isError: true,
+    });
+    throw new ConfirmedActionExecutionError(message, exec, error);
+  }
 }
 
 interface StudioBookListSummary {
@@ -519,9 +901,14 @@ type LLMConfigSource = "env" | "studio";
 interface EnvConfigSummary {
   detected: boolean;
   provider: string | null;
+  service?: string | null;
   baseUrl: string | null;
   model: string | null;
   hasApiKey: boolean;
+}
+
+interface EnvConfigValues extends EnvConfigSummary {
+  apiKey: string | null;
 }
 
 interface EnvConfigStatus {
@@ -558,6 +945,16 @@ function deriveBookIdFromTitle(title: string): string {
     .slice(0, 30);
 }
 
+async function completeBookExists(bookDir: string): Promise<boolean> {
+  try {
+    await access(join(bookDir, "book.json"));
+    await access(join(bookDir, "story", "story_bible.md"));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function resolveArchitectBookIdFromArgs(args?: Record<string, unknown>): string | null {
   if (!args || args.agent !== "architect" || args.revise === true) return null;
   if (typeof args.bookId === "string" && args.bookId.trim()) return args.bookId.trim();
@@ -576,9 +973,13 @@ function resolveCreatedBookIdFromToolExecs(execs: ReadonlyArray<CollectedToolExe
     if (details?.kind === "book_created" && typeof details.bookId === "string" && details.bookId.trim()) {
       return details.bookId.trim();
     }
+  }
+  return null;
+}
 
-    const fromArgs = resolveArchitectBookIdFromArgs(exec.args);
-    if (fromArgs) return fromArgs;
+function resolveCreatedBookIdFromDetails(details: Readonly<Record<string, unknown>> | undefined): string | null {
+  if (details?.kind === "book_created" && typeof details.bookId === "string" && details.bookId.trim()) {
+    return details.bookId.trim();
   }
   return null;
 }
@@ -709,7 +1110,26 @@ async function saveRawConfig(root: string, config: Record<string, unknown>): Pro
   await writeFile(join(root, "inkos.json"), JSON.stringify(config, null, 2), "utf-8");
 }
 
-async function readEnvConfigSummary(path: string): Promise<EnvConfigSummary> {
+function unquoteEnvValue(value: string): string {
+  const trimmed = value.trim();
+  if ((trimmed.startsWith("\"") && trimmed.endsWith("\"")) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+function toEnvConfigSummary(values: EnvConfigValues): EnvConfigSummary {
+  return {
+    detected: values.detected,
+    provider: values.provider,
+    service: values.service ?? null,
+    baseUrl: values.baseUrl,
+    model: values.model,
+    hasApiKey: values.hasApiKey,
+  };
+}
+
+async function readEnvConfigValues(path: string): Promise<EnvConfigValues> {
   try {
     const raw = await readFile(path, "utf-8");
     const values = new Map<string, string>();
@@ -720,42 +1140,55 @@ async function readEnvConfigSummary(path: string): Promise<EnvConfigSummary> {
       const match = trimmed.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
       if (!match) continue;
       const [, key, value] = match;
-      values.set(key, value.trim());
+      values.set(key, unquoteEnvValue(value));
     }
 
     const provider = values.get("INKOS_LLM_PROVIDER") ?? null;
+    const service = values.get("INKOS_LLM_SERVICE") ?? null;
     const baseUrl = values.get("INKOS_LLM_BASE_URL") ?? null;
     const model = values.get("INKOS_LLM_MODEL") ?? null;
     const apiKey = values.get("INKOS_LLM_API_KEY") ?? "";
-    const detected = Boolean(provider || baseUrl || model || apiKey);
+    const detected = Boolean(provider || service || baseUrl || model || apiKey);
 
     return {
       detected,
       provider,
+      service,
       baseUrl,
       model,
       hasApiKey: apiKey.length > 0,
+      apiKey: apiKey.length > 0 ? apiKey : null,
     };
   } catch {
     return {
       detected: false,
       provider: null,
+      service: null,
       baseUrl: null,
       model: null,
       hasApiKey: false,
+      apiKey: null,
     };
   }
 }
 
 async function readEnvConfigStatus(root: string): Promise<EnvConfigStatus> {
-  const project = await readEnvConfigSummary(join(root, ".env"));
-  const global = await readEnvConfigSummary(GLOBAL_ENV_PATH);
+  const project = await readEnvConfigValues(join(root, ".env"));
+  const global = await readEnvConfigValues(GLOBAL_ENV_PATH);
   return {
-    project,
-    global,
+    project: toEnvConfigSummary(project),
+    global: toEnvConfigSummary(global),
     effectiveSource: project.detected ? "project" : global.detected ? "global" : null,
     runtimeUsesEnv: false,
   };
+}
+
+async function readEffectiveEnvConfigValues(root: string): Promise<{ source: "project" | "global"; values: EnvConfigValues } | null> {
+  const project = await readEnvConfigValues(join(root, ".env"));
+  if (project.detected) return { source: "project", values: project };
+  const global = await readEnvConfigValues(GLOBAL_ENV_PATH);
+  if (global.detected) return { source: "global", values: global };
+  return null;
 }
 
 async function resolveConfiguredServiceBaseUrl(root: string, serviceId: string, inlineBaseUrl?: string): Promise<string | undefined> {
@@ -1168,7 +1601,10 @@ async function probeServiceCapabilities(args: {
 
       try {
         await withTimeout(
-          chatCompletion(client, model, [{ role: "user", content: "Reply with OK only." }], { maxTokens: 16 }),
+          // A connectivity probe wants a fast pass/fail — never the transient
+          // retry+backoff, which would multiply the time when the upstream is
+          // rate-limiting (and make the diagnostics page hang).
+          chatCompletion(client, model, [{ role: "user", content: "Reply with OK only." }], { maxTokens: 16, retry: false }),
           SERVICE_CHAT_PROBE_TIMEOUT_MS,
           "service connection test",
         );
@@ -1298,9 +1734,16 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
       defaultLLMConfig: currentConfig.llm,
       foundationReviewRetries: currentConfig.foundation?.reviewRetries ?? 2,
       writingReviewRetries: currentConfig.writing?.reviewRetries ?? 1,
+      chapterReviewMode: (currentConfig.writing as { readonly reviewMode?: string } | undefined)?.reviewMode === "manual" ? "manual" : "auto",
       modelOverrides: currentConfig.modelOverrides,
       notifyChannels: currentConfig.notify,
       logger,
+      onContextCompression: (event) => {
+        broadcast("context:compression", {
+          ...(overrides?.sessionIdForSSE ? { sessionId: overrides.sessionIdForSSE } : {}),
+          ...event,
+        });
+      },
       onStreamProgress: (progress) => {
         broadcast("llm:progress", {
           ...(overrides?.sessionIdForSSE ? { sessionId: overrides.sessionIdForSSE } : {}),
@@ -1370,12 +1813,11 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     const bookId = bookConfig.id;
     const bookDir = state.bookDir(bookId);
 
-    try {
-      await access(join(bookDir, "book.json"));
-      await access(join(bookDir, "story", "story_bible.md"));
+    if (!bookId) {
+      return c.json({ error: "Could not derive a valid book id from title" }, 400);
+    }
+    if (await completeBookExists(bookDir)) {
       return c.json({ error: `Book "${bookId}" already exists` }, 409);
-    } catch {
-      // The target book is not fully initialized yet, so creation can continue.
     }
 
     broadcast("book:creating", { bookId, title: body.title });
@@ -1401,7 +1843,19 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
         readonly session: { readonly activeBookId?: string };
         readonly details?: Readonly<Record<string, unknown>>;
       }) => {
-        const createdBookId = (result.details?.bookId as string | undefined) ?? result.session.activeBookId ?? bookId;
+        const createdBookId = resolveCreatedBookIdFromDetails(result.details);
+        if (!createdBookId) {
+          const error = "Book creation did not produce a completed book artifact.";
+          bookCreateStatus.set(bookId, { status: "error", error });
+          broadcast("book:error", { bookId, error });
+          return;
+        }
+        if (!await completeBookExists(join(root, "books", createdBookId))) {
+          const error = "Book creation artifact is incomplete on disk.";
+          bookCreateStatus.set(createdBookId, { status: "error", error });
+          broadcast("book:error", { bookId: createdBookId, error });
+          return;
+        }
         const book = await loadStudioBookListSummary(state, createdBookId).catch(() => undefined);
         bookCreateStatus.delete(createdBookId);
         broadcast("book:created", { bookId: createdBookId, ...(book ? { book } : {}) });
@@ -1419,10 +1873,18 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
   app.get("/api/v1/books/:id/create-status", async (c) => {
     const id = c.req.param("id");
     const status = bookCreateStatus.get(id);
-    if (!status) {
-      return c.json({ status: "missing" }, 404);
+    if (status) {
+      return c.json(status);
     }
-    return c.json(status);
+    // No in-memory entry. On success the entry is deleted, and a long architect
+    // run (or a server restart) can also drop it — so a bare 404 is ambiguous
+    // ("done" vs "never existed"). Check disk: if the foundation is fully
+    // written, the book really is ready; report that truthfully.
+    const { isBookFoundationComplete } = await import("@actalk/inkos-core");
+    if (await isBookFoundationComplete(state.bookDir(id))) {
+      return c.json({ status: "ready" });
+    }
+    return c.json({ status: "missing" }, 404);
   });
 
   // --- Chapters ---
@@ -1502,11 +1964,13 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
   // GET handler tags them with `legacy: true` so the UI can surface that the
   // edits won't land where the user expects.
   const LEGACY_SHIM_FILES = new Set(["story_bible.md", "book_rules.md"]);
+  const RUNTIME_DIAGNOSTIC_FILE_RE = /^runtime\/chapter-\d{4}\.(?:intent\.md|plan\.md|context\.json|rule-stack\.yaml|trace\.json)$/;
 
   /**
    * Validate a requested truth-file path:
    *   1. Must be one of the declared flat files, an outline/* allow-listed
-   *      entry, or a roles/**\/*.md file under 主要角色/ | 次要角色/.
+   *      entry, a runtime chapter trace file, or a roles/**\/*.md file under
+   *      主要角色/ | 次要角色/.
    *   2. Must resolve to a path inside bookDir/story/ (no `..`, no absolute
    *      paths, no traversal via the tier-name segment).
    */
@@ -1523,6 +1987,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     const allowed =
       TRUTH_FLAT_FILES.includes(file)
       || TRUTH_OUTLINE_FILES.includes(file)
+      || RUNTIME_DIAGNOSTIC_FILE_RE.test(file)
       || /^roles\/(主要角色|次要角色|major|minor)\/[^/]+\.md$/.test(file);
 
     if (!allowed) return null;
@@ -1562,14 +2027,34 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     // can warn users their edits won't reach the runtime.
     // Hotfix: only tag as legacy when the book actually HAS the new layout.
     // Pre-Phase-5 books use story_bible/book_rules as the authoritative source.
-    const { isNewLayoutBook } = await import("@actalk/inkos-core");
+    const { isNewLayoutBook, tryParseBookRulesFrontmatter } = await import("@actalk/inkos-core");
     const legacy = LEGACY_SHIM_FILES.has(file) && await isNewLayoutBook(bookDir);
 
     try {
       const content = await readFile(resolved, "utf-8");
-      return c.json({ file, content, ...(legacy ? { legacy: true } : {}) });
+      // Files like outline/story_frame.md carry a YAML frontmatter block of
+      // structured fields (protagonist / genreLock / prohibitions / ...). Parse
+      // it here so the UI can render those as friendly cards instead of dumping
+      // raw YAML at the reader. `content` stays raw so the editor round-trips it
+      // unchanged; `body` is the prose with the frontmatter stripped.
+      const parsed = tryParseBookRulesFrontmatter(content);
+      const structured = parsed ? { frontmatter: parsed.rules, body: parsed.body } : {};
+      const runtimeDiagnostic = RUNTIME_DIAGNOSTIC_FILE_RE.test(file);
+      return c.json({
+        file,
+        content,
+        ...structured,
+        ...(legacy ? { legacy: true } : {}),
+        ...(runtimeDiagnostic ? { readonly: true, readonlyReason: "runtime-diagnostic" } : {}),
+      });
     } catch {
-      return c.json({ file, content: null, ...(legacy ? { legacy: true } : {}) });
+      const runtimeDiagnostic = RUNTIME_DIAGNOSTIC_FILE_RE.test(file);
+      return c.json({
+        file,
+        content: null,
+        ...(legacy ? { legacy: true } : {}),
+        ...(runtimeDiagnostic ? { readonly: true, readonlyReason: "runtime-diagnostic" } : {}),
+      });
     }
   });
 
@@ -1624,6 +2109,87 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     );
 
     return c.json({ status: "drafting", bookId: id });
+  });
+
+  app.get("/api/v1/books/:id/eval", async (c) => {
+    const id = c.req.param("id");
+    const chapters = c.req.query("chapters");
+    try {
+      return c.json(await evaluateBookQuality({ state, bookId: id, chapters }));
+    } catch (e) {
+      return c.json({ error: String(e) }, 500);
+    }
+  });
+
+  app.post("/api/v1/books/:id/consolidate", async (c) => {
+    const id = c.req.param("id");
+    try {
+      const pipelineConfig = await buildPipelineConfig();
+      const consolidator = new ConsolidatorAgent({
+        client: pipelineConfig.client,
+        model: pipelineConfig.model,
+        projectRoot: root,
+      });
+      const result = await consolidator.consolidate(state.bookDir(id));
+      broadcast("consolidate:complete", { bookId: id, ...result });
+      return c.json(result);
+    } catch (e) {
+      broadcast("consolidate:error", { bookId: id, error: String(e) });
+      return c.json({ error: String(e) }, 500);
+    }
+  });
+
+  app.post("/api/v1/books/:id/plan", async (c) => {
+    const id = c.req.param("id");
+    const body = await c.req.json<{ context?: string }>().catch(() => ({ context: undefined }));
+    try {
+      const pipeline = new PipelineRunner(await buildPipelineConfig());
+      return c.json(await pipeline.planChapter(id, body.context));
+    } catch (e) {
+      return c.json({ error: String(e) }, 500);
+    }
+  });
+
+  app.post("/api/v1/books/:id/compose", async (c) => {
+    const id = c.req.param("id");
+    const body = await c.req.json<{ context?: string }>().catch(() => ({ context: undefined }));
+    try {
+      const pipeline = new PipelineRunner(await buildPipelineConfig());
+      return c.json(await pipeline.composeChapter(id, body.context));
+    } catch (e) {
+      return c.json({ error: String(e) }, 500);
+    }
+  });
+
+  app.post("/api/v1/books/:id/repair-state/:chapter", async (c) => {
+    const id = c.req.param("id");
+    const chapterNum = parseInt(c.req.param("chapter"), 10);
+    try {
+      const pipeline = new PipelineRunner(await buildPipelineConfig());
+      const result = await pipeline.repairChapterState(id, chapterNum);
+      broadcast("repair-state:complete", { bookId: id, chapter: chapterNum });
+      return c.json(result);
+    } catch (e) {
+      broadcast("repair-state:error", { bookId: id, chapter: chapterNum, error: String(e) });
+      return c.json({ error: String(e) }, 500);
+    }
+  });
+
+  app.post("/api/v1/books/:id/foundation/revise", async (c) => {
+    const id = c.req.param("id");
+    const { feedback } = await c.req.json<{ feedback?: string }>().catch(() => ({ feedback: undefined }));
+    if (!feedback?.trim()) {
+      return c.json({ error: "feedback is required" }, 400);
+    }
+    try {
+      const pipeline = new PipelineRunner(await buildPipelineConfig());
+      await pipeline.reviseFoundation(id, feedback.trim());
+      broadcast("foundation:revised", { bookId: id });
+      return c.json({ ok: true });
+    } catch (e) {
+      broadcast("foundation:error", { bookId: id, error: String(e) });
+      return c.json({ error: String(e) }, 500);
+    }
   });
 
   app.post("/api/v1/books/:id/chapters/:num/approve", async (c) => {
@@ -1740,6 +2306,50 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     });
   });
 
+  app.post("/api/v1/services/config/import-env", async (c) => {
+    const env = await readEffectiveEnvConfigValues(root);
+    if (!env || !env.values.apiKey) {
+      return c.json({
+        error: "未检测到可导入的 LLM 环境变量配置，或缺少 INKOS_LLM_API_KEY。",
+      }, 400);
+    }
+
+    const config = await loadRawConfig(root);
+    config.llm = config.llm ?? {};
+    const llm = config.llm as Record<string, unknown>;
+    const existingServices = normalizeServiceConfig(llm.services);
+    const explicitService = env.values.service?.trim();
+    const guessedService = env.values.baseUrl ? guessServiceFromBaseUrl(env.values.baseUrl) : null;
+    const service = explicitService || guessedService || "custom";
+
+    const entry: ServiceConfigEntry = service === "custom"
+      ? {
+          service: "custom",
+          name: "Env LLM",
+          ...(env.values.baseUrl ? { baseUrl: env.values.baseUrl } : {}),
+        }
+      : { service };
+    const serviceKey = serviceConfigKey(entry);
+
+    llm.services = mergeServiceConfig(existingServices, [entry]);
+    llm.service = serviceKey;
+    llm.configSource = "studio";
+    if (env.values.model) llm.defaultModel = env.values.model;
+    syncTopLevelLlmMirror(llm);
+
+    const secrets = await loadSecrets(root);
+    secrets.services[serviceKey] = { apiKey: env.values.apiKey };
+    await saveSecrets(root, secrets);
+    await saveRawConfig(root, config);
+
+    return c.json({
+      ok: true,
+      source: env.source,
+      service: serviceKey,
+      defaultModel: env.values.model ?? null,
+    });
+  });
+
   app.put("/api/v1/services/config", async (c) => {
     const body = await c.req.json<{ services?: unknown; defaultModel?: string; configSource?: LLMConfigSource; service?: string }>();
     const config = await loadRawConfig(root);
@@ -1774,16 +2384,27 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     const llm = (config.llm as Record<string, unknown> | undefined) ?? {};
     const cover = normalizeCoverConfig(llm.cover);
     const secrets = await loadSecrets(root);
+    const keyFor = (service: string): boolean =>
+      Boolean(secrets.services[coverSecretKey(service)]?.apiKey || secrets.services[service]?.apiKey);
+    // "Configured" = a cover service is selected AND has a key, OR a cover
+    // endpoint is provided via env (the CLI/power-user path). This is the gate
+    // for the Play auto-illustration toggles.
+    const envConfigured = Boolean(
+      (process.env.INKOS_COVER_BASE_URL || process.env.INKOS_COVER_ENDPOINT)
+      && (process.env.INKOS_COVER_API_KEY || keyFor("kkaiapi")),
+    );
+    const configured = Boolean(cover?.service && keyFor(cover.service)) || envConfigured;
     return c.json({
       service: cover?.service ?? null,
       model: cover?.model ?? null,
+      configured,
       providers: COVER_PROVIDER_PRESETS.map((provider) => ({
         service: provider.service,
         label: provider.label,
         baseUrl: provider.baseUrl,
         defaultModel: provider.defaultModel,
         models: provider.models,
-        connected: Boolean(secrets.services[coverSecretKey(provider.service)]?.apiKey || secrets.services[provider.service]?.apiKey),
+        connected: keyFor(provider.service),
       })),
     });
   });
@@ -2116,6 +2737,48 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     }
   });
 
+  app.get("/api/v1/project/input-governance-mode", async (c) => {
+    const raw = JSON.parse(await readFile(join(root, "inkos.json"), "utf-8"));
+    return c.json({ mode: raw.inputGovernanceMode === "legacy" ? "legacy" : "v2" });
+  });
+
+  app.put("/api/v1/project/input-governance-mode", async (c) => {
+    const { mode } = await c.req.json<{ mode?: unknown }>();
+    const parsed = InputGovernanceModeSchema.safeParse(mode);
+    if (!parsed.success) {
+      return c.json({ error: "mode must be legacy or v2" }, 400);
+    }
+    const configPath = join(root, "inkos.json");
+    const raw = JSON.parse(await readFile(configPath, "utf-8"));
+    raw.inputGovernanceMode = parsed.data;
+    const { writeFile: writeFileFs } = await import("node:fs/promises");
+    await writeFileFs(configPath, JSON.stringify(raw, null, 2), "utf-8");
+    return c.json({ ok: true, mode: parsed.data });
+  });
+
+  app.get("/api/v1/project/detection", async (c) => {
+    const raw = JSON.parse(await readFile(join(root, "inkos.json"), "utf-8"));
+    return c.json({ detection: raw.detection ?? null });
+  });
+
+  app.put("/api/v1/project/detection", async (c) => {
+    const { detection } = await c.req.json<{ detection?: unknown }>();
+    const configPath = join(root, "inkos.json");
+    const raw = JSON.parse(await readFile(configPath, "utf-8"));
+    if (detection === null) {
+      delete raw.detection;
+    } else {
+      const parsed = DetectionConfigSchema.safeParse(detection);
+      if (!parsed.success) {
+        return c.json({ error: parsed.error.issues.map((issue) => issue.message).join("; ") }, 400);
+      }
+      raw.detection = parsed.data;
+    }
+    const { writeFile: writeFileFs } = await import("node:fs/promises");
+    await writeFileFs(configPath, JSON.stringify(raw, null, 2), "utf-8");
+    return c.json({ ok: true, detection: raw.detection ?? null });
+  });
+
   // --- Truth files browser ---
 
   app.get("/api/v1/books/:id/truth", async (c) => {
@@ -2126,7 +2789,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     async function listDir(subdir: string): Promise<string[]> {
       try {
         const entries = await readdir(join(storyDir, subdir));
-        return entries.filter((f) => f.endsWith(".md") || f.endsWith(".json"));
+        return entries.filter((f) => f.endsWith(".md") || f.endsWith(".json") || f.endsWith(".yaml"));
       } catch {
         return [];
       }
@@ -2136,14 +2799,17 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     const { isNewLayoutBook } = await import("@actalk/inkos-core");
     const newLayout = await isNewLayoutBook(bookDir);
 
-    async function describe(relPath: string): Promise<{ readonly name: string; readonly size: number; readonly preview: string; readonly legacy?: true } | null> {
+    async function describe(relPath: string): Promise<{ readonly name: string; readonly size: number; readonly preview: string; readonly legacy?: true; readonly readonly?: true; readonly readonlyReason?: string } | null> {
       try {
         const content = await readFile(join(storyDir, relPath), "utf-8");
         const isShim = LEGACY_SHIM_FILES.has(relPath) && newLayout;
-        const entry: { readonly name: string; readonly size: number; readonly preview: string; readonly legacy?: true } =
+        const isRuntimeDiagnostic = RUNTIME_DIAGNOSTIC_FILE_RE.test(relPath);
+        const entry: { readonly name: string; readonly size: number; readonly preview: string; readonly legacy?: true; readonly readonly?: true; readonly readonlyReason?: string } =
           isShim
             ? { name: relPath, size: content.length, preview: content.slice(0, 200), legacy: true }
-            : { name: relPath, size: content.length, preview: content.slice(0, 200) };
+            : isRuntimeDiagnostic
+              ? { name: relPath, size: content.length, preview: content.slice(0, 200), readonly: true, readonlyReason: "runtime-diagnostic" }
+              : { name: relPath, size: content.length, preview: content.slice(0, 200) };
         return entry;
       } catch {
         return null;
@@ -2161,6 +2827,9 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
       const minorRolesZh = (await listDir("roles/次要角色")).map((f) => `roles/次要角色/${f}`);
       const majorRolesEn = (await listDir("roles/major")).map((f) => `roles/major/${f}`);
       const minorRolesEn = (await listDir("roles/minor")).map((f) => `roles/minor/${f}`);
+      const runtimeFiles = (await listDir("runtime"))
+        .map((f) => `runtime/${f}`)
+        .filter((f) => RUNTIME_DIAGNOSTIC_FILE_RE.test(f));
 
       const all = [
         ...flatFiles,
@@ -2169,6 +2838,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
         ...minorRolesZh,
         ...majorRolesEn,
         ...minorRolesEn,
+        ...runtimeFiles,
       ];
       const described = await Promise.all(all.map(describe));
       const result = described.filter((x): x is NonNullable<typeof x> => x !== null);
@@ -2266,6 +2936,160 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     });
   });
 
+  // Play worlds are created and advanced by the play_start / play_step agent
+  // tools (worldId === sessionId). The HUD only needs to read a run's state,
+  // so just the run-detail endpoint remains; the old save-slot list/create
+  // endpoints were only used by the removed standalone play page.
+  app.get("/api/v1/play/runs/:worldId/:runId", async (c) => {
+    const worldId = normalizeApiBookId(c.req.param("worldId"), "worldId") ?? "default-world";
+    const runId = normalizeApiBookId(c.req.param("runId"), "runId") ?? "default-run";
+    const store = new PlayStore(root);
+    const db = createPlayDB(store.runDir(worldId, runId));
+    const [transcript, currentState, world] = await Promise.all([
+      store.readTranscript(worldId, runId),
+      store.loadCurrentState(worldId, runId).catch(() => null),
+      store.loadWorld(worldId).catch(() => null),
+    ]);
+    const graph = db.snapshot();
+    db.close?.();
+
+    // Merge generated illustrations (decoupled sidecar) onto entities so the
+    // HUD can render portraits/stills without touching the event-sourced graph.
+    const runDir = store.runDir(worldId, runId);
+    const [manifest, imageSettings] = await Promise.all([
+      readPlayImageManifest(runDir),
+      readPlayImageSettings(runDir),
+    ]);
+    const imageUrlFor = (file?: string): string | undefined =>
+      file ? `/api/v1/play/runs/${encodeURIComponent(worldId)}/${encodeURIComponent(runId)}/images/${encodeURIComponent(file)}` : undefined;
+    const sceneImageUrls = Object.fromEntries(
+      Object.entries(manifest)
+        .filter(([key, entry]) => key.startsWith("scene-turn-") && entry.status === "ready" && entry.file)
+        .map(([key, entry]) => [key, imageUrlFor(entry.file)]),
+    );
+    const entitiesWithImages = (graph.entities ?? []).map((entity: { id: string }) => {
+      const entry = manifest[entity.id];
+      return entry?.status === "ready" && entry.file
+        ? { ...entity, imageUrl: imageUrlFor(entry.file) }
+        : entity;
+    });
+
+    // Illustration of the current moment, if one was generated for this turn.
+    const sceneTurn = (currentState as { turn?: number } | null)?.turn ?? 0;
+    const sceneEntry = manifest[`scene-turn-${sceneTurn}`];
+    const sceneImageUrl = sceneEntry?.status === "ready" ? imageUrlFor(sceneEntry.file) : undefined;
+
+    return c.json({
+      worldId,
+      runId,
+      title: world?.title ?? null,
+      transcript,
+      currentState,
+      graph: { ...graph, entities: entitiesWithImages },
+      imageSettings,
+      sceneImageUrls,
+      ...(sceneImageUrl ? { sceneImageUrl } : {}),
+    });
+  });
+
+  // --- Interactive-world illustration (Play auto-config images) ---
+
+  app.put("/api/v1/play/runs/:worldId/:runId/image-settings", async (c) => {
+    const worldId = normalizeApiBookId(c.req.param("worldId"), "worldId") ?? "default-world";
+    const runId = normalizeApiBookId(c.req.param("runId"), "runId") ?? "default-run";
+    const body = await c.req.json<Partial<PlayImageSettings>>().catch(() => ({} as Partial<PlayImageSettings>));
+    const settings: PlayImageSettings = {
+      actors: Boolean(body.actors),
+      moments: Boolean(body.moments),
+      inventory: Boolean(body.inventory),
+    };
+    const runDir = new PlayStore(root).runDir(worldId, runId);
+    await writePlayImageSettings(runDir, settings);
+    return c.json({ ok: true, imageSettings: settings });
+  });
+
+  app.post("/api/v1/play/runs/:worldId/:runId/generate-image", async (c) => {
+    const worldId = normalizeApiBookId(c.req.param("worldId"), "worldId") ?? "default-world";
+    const runId = normalizeApiBookId(c.req.param("runId"), "runId") ?? "default-run";
+    type GenerateImageBody = {
+      target: "entity" | "scene";
+      entityId?: string;
+      sceneText?: string;
+      sceneKey?: string;
+    };
+    const body = await c.req.json<GenerateImageBody>().catch(() => ({ target: "entity" } as GenerateImageBody));
+
+    const store = new PlayStore(root);
+    const runDir = store.runDir(worldId, runId);
+    const [world, currentState] = await Promise.all([
+      store.loadWorld(worldId).catch(() => null),
+      store.loadCurrentState(worldId, runId).catch(() => null),
+    ]);
+    const worldContext = world
+      ? {
+        premise: world.premise,
+        worldContract: world.worldContract,
+        visualContract: world.visualContract,
+      }
+      : undefined;
+
+    let key: string;
+    let prompt: string;
+    if (body.target === "scene") {
+      // The current moment defaults to the rendered scene projection so the UI
+      // can offer a one-tap "illustrate this moment" without re-sending prose.
+      const sceneText = (
+        (body.sceneText ?? "").trim()
+        || (await store.readProjection(worldId, runId, "projections/scene.md").catch(() => "")).trim()
+      );
+      if (!sceneText) return c.json({ error: "no current scene to illustrate" }, 400);
+      key = body.sceneKey?.trim() || `scene-turn-${(currentState as { turn?: number } | null)?.turn ?? 0}`;
+      prompt = buildPlaySceneImagePrompt(sceneText, worldContext);
+    } else {
+      const entityId = body.entityId?.trim();
+      if (!entityId) return c.json({ error: "entityId is required for an entity image" }, 400);
+      const db = createPlayDB(runDir);
+      const graph = db.snapshot();
+      db.close?.();
+      const entity = (graph.entities ?? []).find((e: { id: string }) => e.id === entityId) as
+        | { id: string; type: string; label: string; summary?: string }
+        | undefined;
+      if (!entity) return c.json({ error: `entity not found: ${entityId}` }, 404);
+      key = entity.id;
+      prompt = buildPlayEntityImagePrompt(entity, worldContext);
+    }
+
+    try {
+      const entry = await generatePlayImage({ root, runDir, key, prompt });
+      const url = entry.status === "ready" && entry.file
+        ? `/api/v1/play/runs/${encodeURIComponent(worldId)}/${encodeURIComponent(runId)}/images/${encodeURIComponent(entry.file)}`
+        : undefined;
+      return c.json({ key, ok: entry.status === "ready", ...entry, ...(url ? { url } : {}) });
+    } catch (e) {
+      // Resolution failure = cover API not configured.
+      return c.json({ error: e instanceof Error ? e.message : String(e), needsCoverConfig: true }, 400);
+    }
+  });
+
+  app.get("/api/v1/play/runs/:worldId/:runId/images/:file", async (c) => {
+    const worldId = normalizeApiBookId(c.req.param("worldId"), "worldId") ?? "default-world";
+    const runId = normalizeApiBookId(c.req.param("runId"), "runId") ?? "default-run";
+    const file = c.req.param("file");
+    if (!file || file.includes("/") || file.includes("..") || file.includes("\0")) {
+      return c.json({ error: "Invalid image file" }, 400);
+    }
+    const runDir = new PlayStore(root).runDir(worldId, runId);
+    try {
+      const { readFile: readFileFs } = await import("node:fs/promises");
+      const content = await readFileFs(join(runDir, "images", file));
+      const ext = file.split(".").pop()?.toLowerCase() ?? "";
+      const contentType = ext === "jpg" || ext === "jpeg" ? "image/jpeg" : "image/png";
+      return new Response(content, { headers: { "Content-Type": contentType } });
+    } catch {
+      return c.notFound();
+    }
+  });
+
   // -- Per-book session endpoints --
 
   app.get("/api/v1/sessions", async (c) => {
@@ -2281,12 +3105,41 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
   });
 
   app.post("/api/v1/sessions", async (c) => {
-    const body = await c.req.json<{ bookId?: string | null; sessionId?: string }>().catch(() => ({}));
+    const body = await c.req.json<{ bookId?: string | null; sessionId?: string; sessionKind?: string; playMode?: string }>().catch(() => ({}));
     const bookId = normalizeApiBookId((body as { bookId?: unknown }).bookId, "bookId");
+    const sessionKind = normalizeStudioSessionKind(
+      (body as { sessionKind?: unknown }).sessionKind,
+      bookId ? "book" : "chat",
+    );
+    const playMode = normalizeStudioPlayMode((body as { playMode?: unknown }).playMode);
     const sessionId = (body as { sessionId?: string }).sessionId;
     // sessionId 只允许 timestamp-random 格式；防止注入任意文件名
     const safeSessionId = sessionId && /^[0-9]+-[a-z0-9]+$/.test(sessionId) ? sessionId : undefined;
-    const session = await createAndPersistBookSession(root, bookId, safeSessionId);
+    const session = await createAndPersistBookSession(
+      root,
+      bookId,
+      safeSessionId,
+      sessionKind,
+      ...(playMode ? [{ playMode }] as const : []),
+    );
+    return c.json({ session });
+  });
+
+  app.put("/api/v1/sessions/:sessionId/play-mode", async (c) => {
+    const body = await c.req.json<{ playMode?: string }>().catch(() => ({}));
+    const playMode = normalizeStudioPlayMode((body as { playMode?: unknown }).playMode);
+    if (!playMode) {
+      throw new ApiError(400, "INVALID_PLAY_MODE", "playMode is required");
+    }
+    const existing = await loadBookSession(root, c.req.param("sessionId"));
+    if (!existing) return c.json({ error: "Session not found" }, 404);
+    const session = await createAndPersistBookSession(
+      root,
+      existing.bookId,
+      existing.sessionId,
+      existing.sessionKind,
+      { playMode },
+    );
     return c.json({ session });
   });
 
@@ -2311,10 +3164,26 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
   });
 
   app.post("/api/v1/agent", async (c) => {
-    const { instruction, activeBookId, sessionId: reqSessionId, model: reqModel, service: reqService } = await c.req.json<{
+    const {
+      instruction,
+      activeBookId,
+      sessionId: reqSessionId,
+      sessionKind: reqSessionKind,
+      actionSource: reqActionSource,
+      requestedIntent: reqRequestedIntent,
+      actionPayload: reqActionPayload,
+      playMode: reqPlayMode,
+      model: reqModel,
+      service: reqService,
+    } = await c.req.json<{
       instruction: string;
       activeBookId?: string;
       sessionId?: string;
+      sessionKind?: string;
+      actionSource?: string;
+      requestedIntent?: string;
+      actionPayload?: unknown;
+      playMode?: string;
       model?: string;
       service?: string;
     }>();
@@ -2330,7 +3199,12 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
       return c.json({ error: message, response: message }, 400);
     }
 
-    broadcast("agent:start", { instruction, activeBookId, sessionId });
+    const actionSource = normalizeStudioActionSource(reqActionSource);
+    const requestedIntent = normalizeStudioRequestedIntent(reqRequestedIntent);
+    const actionPayload = normalizeStudioActionPayload(reqActionPayload);
+    const playMode = normalizeStudioPlayMode(reqPlayMode);
+
+    broadcast("agent:start", { instruction, activeBookId, sessionId, actionSource, requestedIntent });
 
     try {
       // Load config + create LLM client (pipeline created after model resolution)
@@ -2356,9 +3230,24 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
         );
       }
       const agentBookId = requestedActiveBookId ?? persistedBookId;
+      const sessionKind = normalizeStudioSessionKind(
+        reqSessionKind,
+        bookSession.sessionKind ?? (agentBookId ? "book" : "chat"),
+      );
+      if (bookSession.sessionKind !== sessionKind || (playMode && bookSession.playMode !== playMode)) {
+        const updatedSession = await createAndPersistBookSession(
+          root,
+          bookSession.bookId,
+          bookSession.sessionId,
+          sessionKind,
+          ...(playMode ? [{ playMode }] as const : []),
+        );
+        bookSession = updatedSession;
+      }
+      let activeBookConfig: { readonly language?: string } | null = null;
       if (agentBookId) {
         try {
-          await state.loadBookConfig(agentBookId);
+          activeBookConfig = await state.loadBookConfig(agentBookId);
         } catch {
           throw new ApiError(404, "BOOK_NOT_FOUND", `Book not found: ${agentBookId}`);
         }
@@ -2377,12 +3266,14 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
         }
       };
 
-      const externalEdit = await tryHandleExternalChatEdit({
-        root,
-        state,
-        instruction,
-        activeBookId: agentBookId,
-      });
+      const externalEdit = requestedIntent === "edit_artifact" || sessionKind === "edit"
+        ? await tryHandleExternalChatEdit({
+            root,
+            state,
+            instruction,
+            activeBookId: agentBookId,
+          })
+        : null;
       if (externalEdit) {
         await appendManualSessionMessages(root, bookSession.sessionId, [{
           role: "assistant",
@@ -2400,13 +3291,14 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
           },
           stopReason: "stop",
           timestamp: Date.now(),
-        }], instruction);
+        }], instruction, { sessionKind });
         await refreshBookSessionFromTranscript();
-        broadcast("agent:complete", { instruction, activeBookId: externalEdit.activeBookId, sessionId: bookSession.sessionId });
+        broadcast("agent:complete", { instruction, activeBookId: externalEdit.activeBookId, sessionId: bookSession.sessionId, sessionKind });
         return c.json({
           response: externalEdit.responseText,
           session: {
             sessionId: bookSession.sessionId,
+            sessionKind,
             ...(externalEdit.activeBookId ? { activeBookId: externalEdit.activeBookId } : {}),
           },
         });
@@ -2521,9 +3413,106 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
         sessionIdForSSE: bookSession.sessionId,
       }));
 
-      if (agentBookId && isWriteNextInstruction(instruction)) {
+      if (requestedIntent && isConfirmedProductionAction({ actionSource, requestedIntent })) {
+        const pendingBookId = requestedIntent === "create_book" && actionPayload?.createBook?.title
+          ? deriveBookIdFromTitle(actionPayload.createBook.title)
+          : null;
+        if (pendingBookId) {
+          bookCreateStatus.set(pendingBookId, { status: "creating" });
+          broadcast("book:creating", {
+            bookId: pendingBookId,
+            title: actionPayload?.createBook?.title ?? pendingBookId,
+            sessionId: streamSessionId,
+          });
+        }
+
+        try {
+          const exec = await executeConfirmedProductionAction({
+            pipeline,
+            root,
+            sessionId: bookSession.sessionId,
+            streamSessionId,
+            instruction,
+            requestedIntent,
+            actionPayload,
+            ...(playMode ? { playMode } : {}),
+          });
+
+          let createdBookId: string | null = null;
+          if (exec.tool === "sub_agent" && exec.agent === "architect" && exec.status === "completed") {
+            createdBookId = resolveCreatedBookIdFromToolExecs([exec]);
+            if (createdBookId) {
+              try {
+                const migratedSession = await migrateBookSession(root, bookSession.sessionId, createdBookId);
+                if (migratedSession) {
+                  bookSession = migratedSession;
+                }
+              } catch (e) {
+                if (!(e instanceof SessionAlreadyMigratedError)) {
+                  throw e;
+                }
+              }
+              const book = await loadStudioBookListSummary(state, createdBookId).catch(() => undefined);
+              bookCreateStatus.delete(createdBookId);
+              broadcast("book:created", {
+                bookId: createdBookId,
+                sessionId: bookSession.sessionId,
+                ...(book ? { book } : {}),
+              });
+            }
+          }
+
+          const responseText = exec.result ?? "已完成。";
+          await appendManualSessionMessages(root, bookSession.sessionId, [
+            manualToolAssistantMessage(
+              responseText,
+              exec,
+              configuredEntry?.service ?? reqService ?? config.llm.provider,
+              reqModel ?? config.llm.model,
+            ),
+          ], instruction, manualToolAppendOptions(sessionKind, exec));
+          await refreshBookSessionFromTranscript();
+          broadcast("agent:complete", { instruction, activeBookId: createdBookId ?? agentBookId, sessionId: bookSession.sessionId, sessionKind });
+          return c.json({
+            response: responseText,
+            session: {
+              sessionId: bookSession.sessionId,
+              sessionKind,
+              ...(createdBookId ?? agentBookId ? { activeBookId: createdBookId ?? agentBookId } : {}),
+            },
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (pendingBookId) {
+            bookCreateStatus.set(pendingBookId, { status: "error", error: message });
+            broadcast("book:error", { bookId: pendingBookId, sessionId: streamSessionId, error: message });
+          }
+          if (error instanceof ConfirmedActionExecutionError) {
+            await appendManualSessionMessages(root, bookSession.sessionId, [
+              manualToolAssistantMessage(
+                message,
+                error.exec,
+                configuredEntry?.service ?? reqService ?? config.llm.provider,
+                reqModel ?? config.llm.model,
+              ),
+            ], instruction, manualToolAppendOptions(sessionKind, error.exec)).catch(() => undefined);
+            await refreshBookSessionFromTranscript().catch(() => undefined);
+          }
+          broadcast("agent:error", { instruction, activeBookId: agentBookId, sessionId: bookSession.sessionId, sessionKind, error: message });
+          return c.json({
+            error: { code: "AGENT_ACTION_FAILED", message },
+            response: message,
+          }, 502);
+        }
+      }
+
+      if (shouldRunDirectWriteNext({ instruction, agentBookId, sessionKind, actionSource, requestedIntent })) {
+        const directWriteBookId = agentBookId;
+        if (!directWriteBookId) {
+          throw new ApiError(400, "BOOK_ID_REQUIRED", "write_next requires an active book");
+        }
         const toolCallId = `direct-writer-${Date.now().toString(36)}`;
-        const toolArgs = { agent: "writer", bookId: agentBookId };
+        const toolArgs = { agent: "writer", bookId: directWriteBookId };
         broadcast("tool:start", {
           sessionId: streamSessionId,
           id: toolCallId,
@@ -2533,17 +3522,24 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
         });
 
         try {
-          const writeResult = await pipeline.writeNextChapter(agentBookId);
-          const responseText = [
-            `已为 ${agentBookId} 完成第 ${writeResult.chapterNumber} 章`,
-            writeResult.title ? `《${writeResult.title}》` : "",
-            `，字数 ${writeResult.wordCount}，状态 ${writeResult.status}。`,
-          ].join("");
+          const writeResult = await pipeline.writeNextChapter(directWriteBookId);
+          const writeNeedsReview = Boolean(writeResult.status && writeResult.status !== "ready-for-review");
+          const responseText = writeNeedsReview
+            ? [
+                `已为 ${directWriteBookId} 写出第 ${writeResult.chapterNumber} 章`,
+                writeResult.title ? `《${writeResult.title}》` : "",
+                `，字数 ${writeResult.wordCount}，但审稿未通过，状态 ${writeResult.status}，需要复核后再继续。`,
+              ].join("")
+            : [
+                `已为 ${directWriteBookId} 完成第 ${writeResult.chapterNumber} 章`,
+                writeResult.title ? `《${writeResult.title}》` : "",
+                `，字数 ${writeResult.wordCount}，状态 ${writeResult.status}。`,
+              ].join("");
           const toolResult = {
             content: [{ type: "text", text: responseText }],
             details: {
               kind: "chapter_written",
-              bookId: agentBookId,
+              bookId: directWriteBookId,
               chapterNumber: writeResult.chapterNumber,
               title: writeResult.title,
               wordCount: writeResult.wordCount,
@@ -2556,37 +3552,52 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
             tool: "sub_agent",
             result: toolResult,
             details: toolResult.details,
-            isError: false,
+            isError: writeNeedsReview,
           });
-          await appendManualSessionMessages(root, bookSession.sessionId, [{
-            role: "assistant",
-            content: [{ type: "text", text: responseText }],
-            api: "anthropic-messages",
-            provider: configuredEntry?.service ?? reqService ?? config.llm.provider,
-            model: reqModel ?? config.llm.model,
-            usage: {
-              input: 0,
-              output: 0,
-              cacheRead: 0,
-              cacheWrite: 0,
-              totalTokens: 0,
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-            },
-            stopReason: "toolUse",
-            timestamp: Date.now(),
-          }], instruction);
+          const exec: CollectedToolExec = {
+            id: toolCallId,
+            tool: "sub_agent",
+            agent: "writer",
+            label: resolveToolLabel("sub_agent", "writer"),
+            status: writeNeedsReview ? "error" : "completed",
+            args: toolArgs,
+            result: responseText,
+            details: toolResult.details,
+            startedAt: Date.now(),
+            completedAt: Date.now(),
+          };
+          await appendManualSessionMessages(root, bookSession.sessionId, [
+            manualToolAssistantMessage(
+              responseText,
+              exec,
+              configuredEntry?.service ?? reqService ?? config.llm.provider,
+              reqModel ?? config.llm.model,
+            ),
+          ], instruction, manualToolAppendOptions(sessionKind, exec));
           await refreshBookSessionFromTranscript();
-          broadcast("agent:complete", { instruction, activeBookId: agentBookId, sessionId: bookSession.sessionId });
+          broadcast("agent:complete", { instruction, activeBookId: directWriteBookId, sessionId: bookSession.sessionId, sessionKind });
           return c.json({
             response: responseText,
             session: {
               sessionId: bookSession.sessionId,
-              activeBookId: agentBookId,
+              sessionKind,
+              activeBookId: directWriteBookId,
             },
           });
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           const toolResult = { content: [{ type: "text", text: message }] };
+          const exec: CollectedToolExec = {
+            id: toolCallId,
+            tool: "sub_agent",
+            agent: "writer",
+            label: resolveToolLabel("sub_agent", "writer"),
+            status: "error",
+            args: toolArgs,
+            error: message,
+            startedAt: Date.now(),
+            completedAt: Date.now(),
+          };
           broadcast("tool:end", {
             sessionId: streamSessionId,
             id: toolCallId,
@@ -2594,13 +3605,31 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
             result: toolResult,
             isError: true,
           });
-          broadcast("agent:error", { instruction, activeBookId: agentBookId, sessionId: bookSession.sessionId, error: message });
+          await appendManualSessionMessages(root, bookSession.sessionId, [
+            manualToolAssistantMessage(
+              message,
+              exec,
+              configuredEntry?.service ?? reqService ?? config.llm.provider,
+              reqModel ?? config.llm.model,
+            ),
+          ], instruction, manualToolAppendOptions(sessionKind, exec)).catch(() => undefined);
+          await refreshBookSessionFromTranscript().catch(() => undefined);
+          broadcast("agent:error", { instruction, activeBookId: agentBookId, sessionId: bookSession.sessionId, sessionKind, error: message });
           return c.json({
             error: { code: "AGENT_ACTION_FAILED", message },
             response: message,
           }, 502);
         }
       }
+
+      // The surface agent should speak the user's language, not just the project default.
+      // Pre-commitment surfaces (chat / play / short / book-create, no book yet) infer it
+      // from the instruction; committed book/edit sessions keep the configured language.
+      // Without this, an English request on a zh-default project gets Chinese replies — and
+      // a Chinese play world, because play_start then infers from the rewritten premise.
+      const configLanguage = config.language === "en" ? "en" : "zh";
+      const bookLanguage = activeBookConfig?.language === "en" ? "en" : activeBookConfig?.language === "zh" ? "zh" : undefined;
+      const surfaceLanguage = agentBookId ? (bookLanguage ?? configLanguage) : inferLanguage(instruction);
 
       // Run pi-agent session
       const collectedToolExecs: CollectedToolExec[] = [];
@@ -2611,8 +3640,19 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
           pipeline,
           projectRoot: root,
           bookId: agentBookId,
+          sessionKind,
+          playMode,
+          actionSource,
+          requestedIntent,
+          actionPayload,
           sessionId: bookSession.sessionId,
-          language: config.language ?? "zh",
+          language: surfaceLanguage,
+          onContextCompression: (event) => {
+            broadcast("context:compression", {
+              sessionId: streamSessionId,
+              ...event,
+            });
+          },
           onEvent: (event) => {
             if (event.type === "message_update") {
               const ame = event.assistantMessageEvent;
@@ -2711,7 +3751,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
         const actionExecutionError = validateAgentActionExecution({
           instruction,
           agentBookId,
-          responseText: result.responseText,
+          requestedIntent,
           collectedToolExecs,
         });
         if (actionExecutionError) {
@@ -2728,6 +3768,12 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
         const createdBookId = resolveCreatedBookIdFromToolExecs(collectedToolExecs);
         if (!createdBookId) return null;
         if (broadcastedCreatedBookId === createdBookId) return createdBookId;
+        if (!await completeBookExists(join(root, "books", createdBookId))) {
+          const error = "Book creation artifact is incomplete on disk.";
+          bookCreateStatus.set(createdBookId, { status: "error", error });
+          broadcast("book:error", { bookId: createdBookId, sessionId: bookSession.sessionId, error });
+          return null;
+        }
 
         try {
           const migratedSession = await migrateBookSession(root, bookSession.sessionId, createdBookId);
@@ -2752,104 +3798,56 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
       };
 
       if (!result.responseText) {
+        if (hasSuccessfulToolExec(collectedToolExecs, "propose_action")) {
+          await refreshBookSessionFromTranscript();
+          broadcast("agent:complete", { instruction, activeBookId, sessionId: bookSession.sessionId, sessionKind });
+          return c.json({
+            response: "",
+            session: {
+              sessionId: bookSession.sessionId,
+              sessionKind,
+              ...(bookSession.bookId ? { activeBookId: bookSession.bookId } : {}),
+            },
+          });
+        }
+
         if (result.errorMessage) {
           if (resolveCreatedBookIdFromToolExecs(collectedToolExecs)) {
             await finalizeCreatedBook();
           }
+          const failure = formatAgentFailure(result.errorMessage);
           return c.json({
-            error: { code: "AGENT_LLM_ERROR", message: result.errorMessage },
-            response: result.errorMessage,
+            error: { code: failure.code, message: failure.message },
+            response: failure.message,
+          }, failure.status);
+        }
+
+        const actionExecutionError = validateAgentActionExecution({
+          instruction,
+          agentBookId,
+          requestedIntent,
+          collectedToolExecs,
+        });
+        if (actionExecutionError) {
+          return c.json({
+            error: { code: "AGENT_ACTION_NOT_EXECUTED", message: actionExecutionError },
+            response: actionExecutionError,
           }, 502);
         }
 
-        try {
-          const fallbackClient = createLLMClient({
-            ...config.llm,
-            service: configuredEntry?.service ?? reqService ?? config.llm.service,
-            model: reqModel ?? config.llm.model,
-            apiKey: agentApiKey ?? config.llm.apiKey,
-            baseUrl: configuredEntry?.baseUrl ?? "",
-            ...(configuredEntry?.apiFormat ? { apiFormat: configuredEntry.apiFormat } : {}),
-            ...(configuredEntry?.stream !== undefined ? { stream: configuredEntry.stream } : {}),
-          } as ProjectConfig["llm"]);
-          const fallback = await chatCompletion(
-            fallbackClient,
-            reqModel ?? config.llm.model,
-            [
-              { role: "system", content: buildAgentSystemPrompt(agentBookId, config.language ?? "zh") },
-              { role: "user", content: instruction },
-            ],
-            { maxTokens: 256 },
-          );
-          if (fallback.content?.trim()) {
-            const actionExecutionError = validateAgentActionExecution({
-              instruction,
-              agentBookId,
-              responseText: fallback.content,
-              collectedToolExecs,
-            });
-            if (actionExecutionError) {
-              return c.json({
-                error: { code: "AGENT_ACTION_NOT_EXECUTED", message: actionExecutionError },
-                response: actionExecutionError,
-              }, 502);
-            }
-            await appendManualSessionMessages(root, bookSession.sessionId, [{
-              role: "assistant",
-              content: [{ type: "text", text: fallback.content }],
-              api: "anthropic-messages",
-              provider: configuredEntry?.service ?? reqService ?? config.llm.provider,
-              model: reqModel ?? config.llm.model,
-              usage: {
-                input: 0,
-                output: 0,
-                cacheRead: 0,
-                cacheWrite: 0,
-                totalTokens: 0,
-                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-              },
-              stopReason: "stop",
-              timestamp: Date.now(),
-            }], instruction);
-            await refreshBookSessionFromTranscript();
-            const createdBookId = await finalizeCreatedBook();
-            return c.json({
-              response: fallback.content,
-              session: {
-                sessionId: bookSession.sessionId,
-                ...(createdBookId ? { activeBookId: createdBookId } : {}),
-              },
-            });
-          }
-        } catch {
-          // fall through to probe-based diagnosis below
-        }
-
-        try {
-          const probeClient = createLLMClient({
-            ...config.llm,
-            service: configuredEntry?.service ?? reqService ?? config.llm.service,
-            model: reqModel ?? config.llm.model,
-            apiKey: agentApiKey ?? config.llm.apiKey,
-            baseUrl: configuredEntry?.baseUrl ?? "",
-            ...(configuredEntry?.apiFormat ? { apiFormat: configuredEntry.apiFormat } : {}),
-            ...(configuredEntry?.stream !== undefined ? { stream: configuredEntry.stream } : {}),
-          } as ProjectConfig["llm"]);
-          await chatCompletion(
-            probeClient,
-            reqModel ?? config.llm.model,
-            [{ role: "user", content: "ping" }],
-            { maxTokens: 5 },
-          );
-        } catch (probeError) {
-          const probeMessage = probeError instanceof Error ? probeError.message : String(probeError);
-          if (resolveCreatedBookIdFromToolExecs(collectedToolExecs)) {
-            await finalizeCreatedBook();
-          }
+        await refreshBookSessionFromTranscript();
+        const createdBookId = await finalizeCreatedBook();
+        if (requestedIntent || createdBookId || hasSuccessfulToolResult(collectedToolExecs)) {
+          const responseSessionKind = bookSession.sessionKind ?? sessionKind;
+          broadcast("agent:complete", { instruction, activeBookId, sessionId: bookSession.sessionId, sessionKind: responseSessionKind });
           return c.json({
-            error: { code: "AGENT_EMPTY_RESPONSE", message: probeMessage },
-            response: probeMessage,
-          }, 502);
+            response: "",
+            session: {
+              sessionId: bookSession.sessionId,
+              sessionKind: responseSessionKind,
+              ...(createdBookId ?? bookSession.bookId ? { activeBookId: createdBookId ?? bookSession.bookId } : {}),
+            },
+          });
         }
 
         const emptyMessage = "模型未返回文本内容。请检查协议类型（chat/responses）、流式开关或上游服务兼容性。";
@@ -2864,12 +3862,14 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
       await refreshBookSessionFromTranscript();
       await finalizeCreatedBook();
 
-      broadcast("agent:complete", { instruction, activeBookId, sessionId: bookSession.sessionId });
+      const responseSessionKind = bookSession.sessionKind ?? sessionKind;
+      broadcast("agent:complete", { instruction, activeBookId, sessionId: bookSession.sessionId, sessionKind: responseSessionKind });
 
       return c.json({
         response: result.responseText,
         session: {
           sessionId: bookSession.sessionId,
+          sessionKind: responseSessionKind,
           ...(bookSession.bookId ? { activeBookId: bookSession.bookId } : {}),
         },
       });
@@ -2882,7 +3882,7 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
         throw new ApiError(409, "SESSION_ALREADY_MIGRATED", migratedMessage);
       }
       const msg = e instanceof Error ? e.message : String(e);
-      broadcast("agent:error", { instruction, activeBookId, sessionId, error: msg });
+      broadcast("agent:error", { instruction, activeBookId, sessionId, sessionKind: reqSessionKind, error: msg });
 
       // Agent busy — return 429 with user-friendly message
       if (/already processing|prompt.*queue/i.test(msg)) {
@@ -2892,9 +3892,10 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
         }, 429);
       }
 
+      const failure = formatAgentFailure(msg);
       return c.json(
-        { error: { code: "AGENT_ERROR", message: msg } },
-        500,
+        { error: { code: failure.code, message: failure.message } },
+        failure.status,
       );
     }
   });
@@ -3095,6 +4096,24 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     return c.json({ ok: true });
   });
 
+  // --- Chapter review mode (C4a: auto pipeline vs manual checkpoint) ---
+
+  app.get("/api/v1/project/chapter-review-mode", async (c) => {
+    const raw = JSON.parse(await readFile(join(root, "inkos.json"), "utf-8"));
+    return c.json({ mode: raw.writing?.reviewMode === "manual" ? "manual" : "auto" });
+  });
+
+  app.put("/api/v1/project/chapter-review-mode", async (c) => {
+    const { mode } = await c.req.json<{ mode?: string }>();
+    const next = mode === "manual" ? "manual" : "auto";
+    const configPath = join(root, "inkos.json");
+    const raw = JSON.parse(await readFile(configPath, "utf-8"));
+    raw.writing = { ...(raw.writing ?? {}), reviewMode: next };
+    const { writeFile: writeFileFs } = await import("node:fs/promises");
+    await writeFileFs(configPath, JSON.stringify(raw, null, 2), "utf-8");
+    return c.json({ ok: true, mode: next });
+  });
+
   // --- Notify channels ---
 
   app.get("/api/v1/project/notify", async (c) => {
@@ -3156,6 +4175,9 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
           400,
         );
       }
+    }
+    if (RUNTIME_DIAGNOSTIC_FILE_RE.test(file)) {
+      return c.json({ error: "Runtime diagnostic files are read-only" }, 400);
     }
     const { content } = await c.req.json<{ content: string }>();
     const { writeFile: writeFileFs, mkdir: mkdirFs } = await import("node:fs/promises");
@@ -3544,6 +4566,107 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     }
   });
 
+  // --- Side-story (番外) init: companion book inheriting a parent's canon ---
+
+  app.post("/api/v1/spinoff/init", async (c) => {
+    const body = await c.req.json<{
+      title: string; parentBookId: string; direction?: string;
+      genre?: string; platform?: string;
+      targetChapters?: number; chapterWordCount?: number; language?: string;
+    }>();
+    if (!body.title?.trim() || !body.parentBookId?.trim()) {
+      return c.json({ error: "title and parentBookId are required" }, 400);
+    }
+    let parent;
+    try {
+      parent = await state.loadBookConfig(body.parentBookId);
+    } catch {
+      return c.json({ error: `Parent book "${body.parentBookId}" not found` }, 404);
+    }
+    const language = (body.language ?? parent.language) as "zh" | "en" | undefined;
+    const now = new Date().toISOString();
+    const bookConfig = buildStudioBookConfig({
+      title: body.title,
+      genre: body.genre ?? parent.genre ?? "other",
+      platform: body.platform ?? parent.platform,
+      targetChapters: body.targetChapters ?? parent.targetChapters,
+      chapterWordCount: body.chapterWordCount ?? parent.chapterWordCount,
+      ...(language ? { language } : {}),
+    }, now);
+    const bookId = bookConfig.id;
+    if (!bookId) {
+      return c.json({ error: "Could not derive a valid book id from title" }, 400);
+    }
+    if (await completeBookExists(state.bookDir(bookId))) {
+      return c.json({ error: `Book "${bookId}" already exists` }, 409);
+    }
+    broadcast("spinoff:start", { bookId, title: body.title, parentBookId: body.parentBookId });
+    bookCreateStatus.set(bookId, { status: "creating" });
+    void (async () => {
+      try {
+        const pipeline = new PipelineRunner(await buildPipelineConfig());
+        await pipeline.initSpinoffBook(bookConfig, body.parentBookId, body.direction);
+        const book = await loadStudioBookListSummary(state, bookId).catch(() => undefined);
+        bookCreateStatus.delete(bookId);
+        broadcast("spinoff:complete", { bookId });
+        broadcast("book:created", { bookId, ...(book ? { book } : {}) });
+      } catch (e) {
+        const error = e instanceof Error ? e.message : String(e);
+        bookCreateStatus.set(bookId, { status: "error", error });
+        broadcast("spinoff:error", { bookId, error });
+        broadcast("book:error", { bookId, error });
+      }
+    })();
+    return c.json({ status: "creating", bookId });
+  });
+
+  // --- Imitation (仿写) init: original story imitating a reference work's style ---
+
+  app.post("/api/v1/imitation/init", async (c) => {
+    const body = await c.req.json<{
+      title: string; referenceText: string; storyIdea: string; sourceName?: string;
+      genre?: string; platform?: string;
+      targetChapters?: number; chapterWordCount?: number; language?: string;
+    }>();
+    if (!body.title?.trim() || !body.referenceText?.trim() || !body.storyIdea?.trim()) {
+      return c.json({ error: "title, referenceText and storyIdea are required" }, 400);
+    }
+    const now = new Date().toISOString();
+    const bookConfig = buildStudioBookConfig({
+      title: body.title,
+      genre: body.genre ?? "other",
+      platform: body.platform,
+      targetChapters: body.targetChapters,
+      chapterWordCount: body.chapterWordCount,
+      ...(body.language ? { language: body.language as "zh" | "en" } : {}),
+    }, now);
+    const bookId = bookConfig.id;
+    if (!bookId) {
+      return c.json({ error: "Could not derive a valid book id from title" }, 400);
+    }
+    if (await completeBookExists(state.bookDir(bookId))) {
+      return c.json({ error: `Book "${bookId}" already exists` }, 409);
+    }
+    broadcast("imitation:start", { bookId, title: body.title });
+    bookCreateStatus.set(bookId, { status: "creating" });
+    void (async () => {
+      try {
+        const pipeline = new PipelineRunner(await buildPipelineConfig());
+        await pipeline.initImitationBook(bookConfig, body.referenceText, body.storyIdea, body.sourceName);
+        const book = await loadStudioBookListSummary(state, bookId).catch(() => undefined);
+        bookCreateStatus.delete(bookId);
+        broadcast("imitation:complete", { bookId });
+        broadcast("book:created", { bookId, ...(book ? { book } : {}) });
+      } catch (e) {
+        const error = e instanceof Error ? e.message : String(e);
+        bookCreateStatus.set(bookId, { status: "error", error });
+        broadcast("imitation:error", { bookId, error });
+        broadcast("book:error", { bookId, error });
+      }
+    })();
+    return c.json({ status: "creating", bookId });
+  });
+
   // --- Radar Scan ---
 
   app.post("/api/v1/radar/scan", async (c) => {
@@ -3592,18 +4715,25 @@ export function createStudioServer(initialConfig: ProjectConfig, root: string) {
     try {
       const currentConfig = await loadCurrentProjectConfig({ requireApiKey: false });
       const service = currentConfig.llm.service ?? currentConfig.llm.provider;
-      const probe = await probeServiceCapabilities({
-        root,
-        service,
-        apiKey: currentConfig.llm.apiKey,
-        baseUrl: currentConfig.llm.baseUrl,
-        preferredApiFormat: currentConfig.llm.apiFormat,
-        preferredStream: currentConfig.llm.stream,
-        preferredModel: currentConfig.llm.model,
-        proxyUrl: currentConfig.llm.proxyUrl,
-      });
+      // Hard overall budget so the diagnostics page never hangs on a slow /
+      // rate-limited upstream — if we can't confirm connectivity quickly, report
+      // it as not-connected rather than spinning.
+      const probe = await withTimeout(
+        probeServiceCapabilities({
+          root,
+          service,
+          apiKey: currentConfig.llm.apiKey,
+          baseUrl: currentConfig.llm.baseUrl,
+          preferredApiFormat: currentConfig.llm.apiFormat,
+          preferredStream: currentConfig.llm.stream,
+          preferredModel: currentConfig.llm.model,
+          proxyUrl: currentConfig.llm.proxyUrl,
+        }),
+        DOCTOR_LLM_PROBE_BUDGET_MS,
+        "doctor llm probe",
+      );
       checks.llmConnected = probe.ok;
-    } catch { /* ignore */ }
+    } catch { /* slow/unreachable upstream — leave llmConnected false */ }
 
     return c.json(checks);
   });

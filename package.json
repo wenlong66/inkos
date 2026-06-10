@@ -1,6 +1,6 @@
 {
   "name": "inkos",
-  "version": "1.4.1",
+  "version": "1.5.0",
   "private": true,
   "description": "Autonomous AI novel writing CLI agent — 10-agent pipeline that writes, audits, and revises novels with continuity tracking",
   "keywords": [
@@ -27,7 +27,9 @@
     "test": "pnpm -r test",
     "lint": "pnpm -r lint",
     "typecheck": "pnpm -r typecheck",
+    "audit:semantic-patterns": "node scripts/audit-semantic-patterns.mjs",
     "verify:publish-manifests": "node scripts/verify-no-workspace-protocol.mjs packages/core packages/cli packages/studio",
+    "benchmark:studio-e2e": "node scripts/studio-e2e-benchmark.mjs",
     "release": "pnpm build && pnpm test"
   },
   "engines": {
